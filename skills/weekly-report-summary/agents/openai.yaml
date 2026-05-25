@@ -1,0 +1,3 @@
+display_name: 周报汇总
+short_description: 按城市汇总多个日报表格并生成周报Excel
+default_prompt: 上传多个日报表格或压缩包后，询问要汇总的城市，并生成该城市周报汇总表。
