@@ -1,0 +1,4 @@
+interface:
+  display_name: "多多价格查询"
+  short_description: "解析多多买菜商品排期JSON，支持直接cookie或Node请求代码取cookie并导出CSV和Excel"
+  default_prompt: "请使用多多价格查询：先提示我提供JSON，解析通过后再从我提供的cookie或Node请求代码中取cookie，并查询价格导出CSV和Excel"
