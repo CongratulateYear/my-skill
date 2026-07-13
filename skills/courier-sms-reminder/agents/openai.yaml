@@ -1,0 +1,4 @@
+interface:
+  display_name: "快递短信提醒"
+  short_description: "解析快递短信并写入 iOS 提醒事项，支持金星/七一等位置识别"
+  default_prompt: "请使用快递短信提醒：解析我发来的快递短信，写入提醒事项列表“快递”，每次都新增，不做去重。"
