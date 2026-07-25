@@ -1,0 +1,6 @@
+interface:
+  display_name: "获取商品货号"
+  short_description: "用真实浏览器登录态批量查询淘宝/天猫商品参数信息里的货号和型号"
+  default_prompt: "Use $get-product-huohao to extract product IDs where 运营 is blank, query Taobao/Tmall item detail Document SSR data and 参数信息 DOM in a real logged-in browser, then export 货号 and 型号 to Excel."
+policy:
+  allow_implicit_invocation: true

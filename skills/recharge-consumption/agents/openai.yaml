@@ -1,0 +1,7 @@
+interface:
+  display_name: "\u5145\u503c\u6d88\u8017"
+  short_description: "\u6839\u636e Sheet1 \u660e\u7ec6\u751f\u6210\u56fa\u5b9a\u683c\u5f0f\u7684\u5145\u503c\u6d88\u8017\u6c47\u603b\u8868"
+  default_prompt: "Use $recharge-consumption to generate recharge/consumption summary workbook from a user-provided source Excel workbook."
+
+policy:
+  allow_implicit_invocation: true
