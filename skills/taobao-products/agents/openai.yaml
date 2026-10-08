@@ -1,0 +1,3 @@
+display_name: 淘宝商品获取
+short_description: 淘宝搜索商品按销量降序抓取前 N 条，导出含缩略图与商品链接的 Excel
+default_prompt: 请使用淘宝商品获取：先确认搜索关键词和抓取条数（默认50条），检查淘宝登录态后按销量降序抓取，并导出带商品缩略图和链接的 Excel。
