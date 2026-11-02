@@ -1,0 +1,4 @@
+interface:
+  display_name: "资产盘算"
+  short_description: "下载天猫账单并自动写入盘算与公司汇总"
+  default_prompt: "使用 $asset-inventory 根据我发送的一条 fetch 默认执行全部16个账单流程（含所有商品效果数据导出），下载、解压并写入同一盘算工作簿生成公司汇总。"
