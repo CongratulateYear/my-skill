@@ -36,6 +36,7 @@ Skill 可以理解为一组可复用的工作说明、脚本、模板和参考�
 | `get-product-huohao` | 从 Excel 筛选运营为空的商品 ID，用已登录浏览器查询淘宝/天猫参数信息中的货号和型号，支持断点续跑和 XLSX 导出。 |
 | `taobao-products` | 淘宝商品获取：搜索关键词后按销量降序抓取前 N 条商品，导出含商品缩略图、商品链接与图片链接的 Excel（依赖 OpenCLI + 本机 Chrome 已登录的淘宝会话）。 |
 | `asset-inventory` | 资产盘算：给出店铺名、支付区间、结算区间后，复用本机浏览器已登录的天猫会话，按固定顺序跑完全部 17 个账单流程（下载 → 写入模板 → 交付），生成固定 30 列表头的公司汇总盘算工作簿与分类明细；支持多店铺按顺序串行执行与断点续跑。 |
+| `nodeseek-checkin` | NodeSeek 每日签到：用本机 magpie-browser 打开 nodeseek.com 判断登录态（未登录则过 Cloudflare Turnstile 完成登录），进入 /board 点「试试手气」完成签到，并报告获得的鸡腿数与当前排名。依赖 magpie-browser MCP（真实已登录浏览器会话），不使用 chrome-devtools。 |
 
 ## 推荐目录结构
 
