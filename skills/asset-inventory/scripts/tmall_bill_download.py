@@ -174,6 +174,13 @@ DEFAULT_PAN_SUAN_TEMPLATE = SKILL_ROOT / "assets" / "盘算模板.xlsx"
 DEFAULT_SPREADSHEET_PYTHON = Path(
     "/Users/rabbit/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3"
 )
+# Extra places an openpyxl-capable interpreter plausibly lives; the hardcoded
+# Codex runtime above only exists on machines that installed that bundle.
+EXTRA_SPREADSHEET_PYTHONS = (
+    Path("/tmp/aivenv/bin/python"),
+    Path.home() / ".local/bin/python3.12",
+    Path.home() / ".local/bin/python3.13",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -334,11 +341,21 @@ def load_browser_headers() -> dict[str, str]:
         sys.path.insert(0, scripts_dir)
     import tmall_session
 
-    headers = tmall_session.build_headers()
+    try:
+        headers = tmall_session.build_headers()
+    except tmall_session.SessionError as exc:
+        raise ValueError(
+            "本机浏览器里没有可用的天猫登录 cookie。先运行 "
+            "`python3 scripts/ensure_login.py` 确认状态，再用 magpie-browser 在当前已打开的"
+            "浏览器里打开 https://tgcwork.tmall.com/login 完成登录（复用已有标签，不要新开浏览器），"
+            "然后重跑本命令。" + (f"（诊断：{str(exc).splitlines()[0]}）" if str(exc) else "")
+        ) from exc
     if not tmall_session.check_session(headers):
         raise ValueError(
-            "本机浏览器登录态已失效：请在 Chrome 中登录 "
-            "https://tgcwork.tmall.com/login 后重试"
+            "本机浏览器登录态已失效（cookie 在但天猫不认）。先运行 "
+            "`python3 scripts/ensure_login.py` 确认状态，再用 magpie-browser 在当前已打开的"
+            "浏览器里打开 https://tgcwork.tmall.com/login 重新登录（复用已有标签，不要新开浏览器），"
+            "然后重跑本命令。"
         )
     return headers
 
@@ -460,7 +477,7 @@ def post(session: Any, url: str, headers: dict[str, str], payload: dict[str, Any
         except (ValueError, UnicodeDecodeError):
             data = {"_text": raw.decode("utf-8", errors="replace")[:1000]}
         if exc.code == 401 or is_auth_failure(data):
-            raise AuthenticationError(f"HTTP {exc.code}：登录态已失效，请提供重新登录后复制的最新 fetch") from exc
+            raise AuthenticationError(f"HTTP {exc.code}：登录态已失效。请先跑 scripts/ensure_login.py（退出码 3 时按 SKILL.md「登录态自愈」用 magpie-browser 在当前浏览器里重新登录），确认 loggedIn=true 后重跑本命令") from exc
         raise RuntimeError(f"HTTP {exc.code}: {safe_summary(data)}") from exc
     try:
         data: Any = json.loads(raw.decode("utf-8"))
@@ -468,7 +485,7 @@ def post(session: Any, url: str, headers: dict[str, str], payload: dict[str, Any
         data = {"_text": raw.decode("utf-8", errors="replace")[:1000]}
     if isinstance(data, dict) and data.get("success") is False:
         if is_auth_failure(data):
-            raise AuthenticationError("登录态已失效，请提供重新登录后复制的最新 fetch")
+            raise AuthenticationError("登录态已失效。请先跑 scripts/ensure_login.py（退出码 3 时按 SKILL.md「登录态自愈」用 magpie-browser 在当前浏览器里重新登录），确认 loggedIn=true 后重跑本命令")
         raise RuntimeError(f"接口失败：{safe_summary(data)}")
     return response, data
 
@@ -489,7 +506,7 @@ def get_json(session: Any, url: str, headers: dict[str, str]) -> Any:
         except (ValueError, UnicodeDecodeError):
             data = {"_text": raw.decode("utf-8", errors="replace")[:1000]}
         if exc.code == 401 or is_auth_failure(data):
-            raise AuthenticationError(f"HTTP {exc.code}：登录态已失效，请提供重新登录后复制的最新 fetch") from exc
+            raise AuthenticationError(f"HTTP {exc.code}：登录态已失效。请先跑 scripts/ensure_login.py（退出码 3 时按 SKILL.md「登录态自愈」用 magpie-browser 在当前浏览器里重新登录），确认 loggedIn=true 后重跑本命令") from exc
         raise RuntimeError(f"HTTP {exc.code}: {safe_summary(data)}") from exc
     try:
         data: Any = json.loads(raw.decode("utf-8"))
@@ -497,7 +514,7 @@ def get_json(session: Any, url: str, headers: dict[str, str]) -> Any:
         data = {"_text": raw.decode("utf-8", errors="replace")[:1000]}
     if isinstance(data, dict) and data.get("success") is False:
         if is_auth_failure(data):
-            raise AuthenticationError("登录态已失效，请提供重新登录后复制的最新 fetch")
+            raise AuthenticationError("登录态已失效。请先跑 scripts/ensure_login.py（退出码 3 时按 SKILL.md「登录态自愈」用 magpie-browser 在当前浏览器里重新登录），确认 loggedIn=true 后重跑本命令")
         raise RuntimeError(f"接口失败：{safe_summary(data)}")
     return data
 
@@ -729,7 +746,11 @@ def find_spreadsheet_python() -> Path:
     configured = os.environ.get("CODEX_SPREADSHEET_PYTHON")
     if configured:
         candidates.append(Path(configured).expanduser())
-    candidates.extend([DEFAULT_SPREADSHEET_PYTHON, Path(sys.executable)])
+    candidates.extend([
+        DEFAULT_SPREADSHEET_PYTHON,
+        *EXTRA_SPREADSHEET_PYTHONS,
+        Path(sys.executable),
+    ])
     checked: set[Path] = set()
     for candidate in candidates:
         candidate = candidate.resolve()
@@ -1410,12 +1431,13 @@ def dry_run_plan(
             })
         elif module.get("api_style") == "hosting":
             pair = dates["orderPayTime"]
-            create_url = f"{HOSTING_BASE}/task/createDownloadTask?{urlencode({
+            hosting_query = urlencode({
                 'bizType': module['biz_type'],
                 'bizScene': module['biz_scene'],
                 'startDate': pair['start'].replace('-', ''),
                 'endDate': pair['end'].replace('-', ''),
-            })}"
+            })
+            create_url = f"{HOSTING_BASE}/task/createDownloadTask?{hosting_query}"
             plans.append({
                 "module": key,
                 "name": module["name"],

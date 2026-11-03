@@ -1,6 +1,6 @@
 ---
 name: fine-export
-description: 罚款导出工作流：从天猫 rules-center（商家处罚中心）按支付日期导出罚款明细（违规记录+赔付记录），默认直接复用本机浏览器已登录的天猫会话（无需用户发 fetch），自动校验登录态并获取 XSRF token；支持多账户串行导出（一个账户一个账户，切换登录后重跑同一命令续跑）；输出 11 列「处罚数据」格式 Excel（`店铺_罚款_支付开始_支付结束.xlsx`，店铺右侧带「类型」列：处罚数据/赔付追缴），表头与资产盘算的处罚数据 Sheet 一致，可直接导入盘算工作簿。当用户要求导出罚款、处罚数据、违规罚款、赔付记录时使用。
+description: 罚款导出工作流：从天猫 rules-center（商家处罚中心）按支付日期导出罚款明细（违规记录+赔付记录），默认直接复用本机浏览器已登录的天猫会话（无需用户发 fetch），自动校验登录态并获取 XSRF token；登录态失效时用 magpie-browser 在当前已打开的浏览器里自动登录（不开新浏览器、不落盘密码）；支持多账户串行导出（一个账户一个账户，切换登录后重跑同一命令续跑）；输出 11 列「处罚数据」格式 Excel（`店铺_罚款_支付开始_支付结束.xlsx`，店铺右侧带「类型」列：处罚数据/赔付追缴），表头与资产盘算的处罚数据 Sheet 一致，可直接导入盘算工作簿。当用户要求导出罚款、处罚数据、违规罚款、赔付记录时使用。
 ---
 
 # 罚款导出（fine-export）
@@ -15,6 +15,7 @@ fine-export/
 ├── agents/openai.yaml           # 技能卡片（display_name 等）
 └── scripts/
     ├── tmall_session.py         # 浏览器 cookie 解密 + 登录态校验（与 asset-inventory 同一份）
+    ├── ensure_login.py          # 登录态闸门（唯一入口，0/3/1 退出码 + action 人话动作）
     ├── fine_export.py           # 单账户导出主脚本
     └── multi_account_runner.py  # 多账户串行执行器
 ```
@@ -46,7 +47,7 @@ python3 scripts/fine_export.py \
 
 1. `resolve_headers`：从本机 Chromium 系浏览器 cookie 库解密登录态（默认 `--browser chrome`，可选 chrome-beta/chrome-canary/edge/brave/chromium）。凭据只进内存，不写入技能文件、状态文件或日志。
 2. `check_session`：调 `https://scm.tmall.com/loginStatus` 校验登录态；失败提示用户打开 `https://tgcwork.tmall.com/login` 登录后重试，退出码 2。
-3. **获取 token**：从 cookie 中的 `X-XSRF-TOKEN` 提取为 `x-xsrf-token` 请求头（`require_token`）。缺失则直接报 AuthenticationError（POST 会被 XSRF 校验拒绝，不让请求白打）。只打印「token 已获取」和脱敏诊断（账号、cookie 项数），**绝不打印 token 值**。
+3. **获取 token**：从 cookie 中的 `XSRF-TOKEN`（部分环境为 `X-XSRF-TOKEN`，两个名字都接受）提取为 `x-xsrf-token` 请求头（`require_token`）。缺失则直接报 AuthenticationError（POST 会被 XSRF 校验拒绝，不让请求白打）。只打印「token 已获取」和脱敏诊断（账号、cookie 项数），**绝不打印 token 值**。
 4. 两个 tab 各自按 `pageNo` 翻页（`POST https://tgc.tmall.com/ds/api/v1/rules-center/pageList`，Referer 为 rules-center 页面，pageSize 50，最多 60 页），按 `paginator.items`（回退 `total`）取满；取不满报错停止，**不写残缺文件**。
 5. 行映射 → 写出 `<safe_prefix(店铺)>_罚款_<pay_start>_<pay_end>.xlsx`，Sheet 名「处罚数据」。
 
@@ -96,7 +97,8 @@ python3 scripts/multi_account_runner.py --accounts-file accounts.json --output-r
 
 闸门语义（与 asset-inventory multi_shop_runner 一致）：
 
-- 每个账户执行前校验登录态：未登录 → 输出 `{"status":"需要登录","action":"请在 Chrome 中登录店铺「X」的天猫账号后重跑本命令"}` 退出码 3；提供了 `accountHint` 且与当前登录昵称不符 → 「登录态与店铺不匹配」退 3；与上一账户昵称相同 → 「登录态没有切换」退 3。
+- 每个账户执行前校验登录态：未登录 → 输出 `{"status":"需要登录",...}` 退出码 3；提供了 `accountHint` 且与当前登录昵称不符 → 「登录态与店铺不匹配」退 3；与上一账户昵称相同 → 「登录态没有切换」退 3。
+- 退 3 时**不要直接把球踢回给用户**：先跑 `scripts/ensure_login.py`（与 asset-inventory 同一份、同一个天猫登录态，退出码 0=有效 / 3=需登录 / 1=出错），只有 3 才用 magpie-browser 在**当前已打开的浏览器**里复用（没有才 `tab_new`）一个 `tgcwork.tmall.com` 标签登录该账户——不开新浏览器实例、不落盘密码、不挖钥匙串；登录后用 `ensure_login.py --wait 30` 确认 `loggedIn: true`，再重跑同一条命令续跑。仅当出现短信/滑块验证码或用户明确拒绝自动登录时才交回人工。
 - 退 3 后**重跑同一条命令**即可续跑：已完成账户凭产物文件判定，配 `--skip-completed` 跳过。
 - 每账户输出目录 `<root>/<safe_prefix(店)>/`，日志 `logs/export.log`，罚款文件必须实际存在才算完成。
 - 批次状态 `<root>/fine-export-state.json`（原子写：.tmp → replace），按 shop 名去重更新。
@@ -115,8 +117,8 @@ python3 scripts/fine_export.py --shop-name X --pay-start 2026-10-01 --pay-end 20
 
 ## 失败处理
 
-- 退出码 2（单账户）/ 3（多账户）= 登录问题：引导用户在 Chrome 打开 `https://tgcwork.tmall.com/login` 登录对应账号后重跑。
-- 登录 cookie 缺 `X-XSRF-TOKEN`：提示重新登录 tgc.tmall.com 或改用 `--fetch-file`。
+- 退出码 2（单账户）/ 3（多账户）= 登录问题：先跑 `ensure_login.py` 判定，为 3 时用 magpie-browser 在当前已打开的浏览器里（复用已有 `tgcwork.tmall.com` 标签，没有才 `tab_new`）登录对应账号，`ensure_login.py --wait 30` 确认后重跑同一命令；不要新开浏览器、不要落盘密码。
+- 登录 cookie 缺 XSRF token（`XSRF-TOKEN` 与 `X-XSRF-TOKEN` 都没有）：提示重新登录 tgc.tmall.com 或改用 `--fetch-file`。
 - 数据取不满（翻页 60 页仍未达总数）：报错停止，不写残缺文件。
 - 所有错误信息经脱敏（cookie / authorization / x-xsrf-token / URL 一律 redact）。
 

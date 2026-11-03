@@ -278,11 +278,12 @@ def require_token(headers: dict[str, str]) -> dict[str, Any]:
         raise AuthenticationError("登录态里没有 cookie，无法请求天猫接口")
     if not state["hasXsrfToken"]:
         raise AuthenticationError(
-            "登录 cookie 中没有 X-XSRF-TOKEN，POST 会被 XSRF 校验拒绝；"
-            "请在浏览器重新登录 tgc.tmall.com 后重试，或换用 --fetch-file 提供完整请求头"
+            "登录 cookie 中没有 XSRF token（XSRF-TOKEN 与 X-XSRF-TOKEN 均未找到），"
+            "POST 会被 XSRF 校验拒绝；请在浏览器重新登录 tgc.tmall.com 后重试，"
+            "或换用 --fetch-file 提供完整请求头"
         )
     print(
-        "token 已获取：X-XSRF-TOKEN"
+        "token 已获取：XSRF"
         f"（账号 {state['account']}，cookie {state['cookieCount']} 项，值不打印）"
     )
     return state
@@ -593,7 +594,10 @@ def main(argv: list[str] | None = None) -> int:
     headers = resolve_headers(args)
     if not check_session(headers):
         raise AuthenticationError(
-            "登录态校验失败：请在 Chrome 打开 https://tgcwork.tmall.com/login 登录后重试"
+            "登录态校验失败：请在当前浏览器里打开 https://tgcwork.tmall.com/login 重新登录"
+            "（复用已有标签，不要新开浏览器），或用 "
+            "/Users/rabbit/.agents/skills/asset-inventory/scripts/ensure_login.py --wait 30 "
+            "确认 loggedIn=true 后重试"
         )
     require_token(headers)
 

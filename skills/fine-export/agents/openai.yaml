@@ -1,4 +1,4 @@
 interface:
   display_name: "罚款导出"
   short_description: "按支付日期导出天猫罚款明细，支持多账户串行"
-  default_prompt: "使用 $fine-export 按我给出的店铺和支付日期，直接复用本机浏览器登录态导出罚款明细 Excel；多个账户时一个账户一个账户串行执行。"
+  default_prompt: "使用 $fine-export 按我给出的店铺和支付日期，直接复用本机浏览器登录态导出罚款明细 Excel（登录失效时用 magpie-browser 在当前浏览器里自动登录）；多个账户时一个账户一个账户串行执行。"

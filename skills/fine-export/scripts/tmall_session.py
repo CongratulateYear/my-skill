@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Build a tmall session from the local Chromium-family cookie store.
 
-The user logs in once in their real browser (or an agent drives the login form
-with the supplied account/password). This module then reads the browser's
-cookie database, decrypts it with the OS keychain key, and produces the request
-headers needed by the tmall bill APIs.
+The user logs in once in their real browser; when the session has expired the
+agent drives the login form through magpie-browser in that same browser (never a
+new browser window, never a stored password). This module then reads the
+browser's cookie database, decrypts it with the OS keychain key, and produces the
+request headers needed by the tmall bill APIs.
 
 Credentials never leave memory: nothing is written to the skill directory, the
 workbook, the state file, or logs. Only non-secret diagnostics are printed.
@@ -31,6 +32,11 @@ DEFAULT_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"
 )
+
+# Tmall has shipped the XSRF cookie under both names; the live one is XSRF-TOKEN.
+XSRF_COOKIE_NAMES = ("XSRF-TOKEN", "X-XSRF-TOKEN")
+# Identity cookies, most reliable first; empty values are skipped.
+HINT_COOKIE_ORDER = ("tracknick", "lgc", "cookie17", "unb", "sn")
 
 # Browser key -> (support dir relative to ~/Library/Application Support, keychain label)
 BROWSERS: dict[str, dict[str, str]] = {
@@ -239,15 +245,24 @@ def build_headers(browser: str = "chrome", domain: str = DEFAULT_DOMAIN) -> dict
                 "referer": TMALL_HOME_URL,
                 "x-requested-with": "XMLHttpRequest",
             }
+            # Tmall has shipped both spellings; the cookie actually present is the
+            # non-`X-` form (host tgc.tmall.com), so accept either spelling.
             for cookie in cookies:
-                if cookie["name"] == "X-XSRF-TOKEN" and cookie["value"]:
+                if cookie["name"] in XSRF_COOKIE_NAMES and cookie["value"]:
                     headers["x-xsrf-token"] = cookie["value"]
                     break
-            print(f"已读取登录态：{BROWSERS[name]['name']} / {path.parent.name}（{len(cookies)} 条 cookie）")
+            # Keep stdout clean: callers parse --json output.
+            print(
+                f"已读取登录态：{BROWSERS[name]['name']} / {path.parent.name}"
+                f"（{len(cookies)} 条 cookie）",
+                file=sys.stderr,
+            )
             return headers
     raise SessionError(
-        "未能在本机浏览器中找到可用的天猫登录态。请先在浏览器里登录 tgc.tmall.com，"
-        "或提供账号密码由自动化完成登录。\n" + "\n".join(f"- {item}" for item in errors)
+        "未能在本机浏览器中找到可用的天猫登录态（浏览器里没有有效登录 cookie）。"
+        "请先在当前已打开的浏览器里打开 https://tgcwork.tmall.com/login 完成登录"
+        "（复用已有标签，没有才新开一个；不要新开浏览器实例，不要把密码落盘）。\n"
+        + "\n".join(f"- {item}" for item in errors)
     )
 
 
@@ -267,10 +282,19 @@ def check_session(headers: dict[str, str]) -> bool:
 
 
 def account_hint(headers: dict[str, str]) -> str:
-    """Non-secret identity hint (login nick) for diagnostics."""
+    """Non-secret identity hint (login nick) for diagnostics.
+
+    Empty values are skipped on purpose: tmall leaves `lgc=`/`sn=` blank on some
+    sessions, and a blank hint would silently disable the multi-account gate.
+    """
+    cookies: dict[str, str] = {}
     for part in headers.get("cookie", "").split("; "):
-        if part.startswith("tracknick=") or part.startswith("lgc="):
-            return part.split("=", 1)[1]
+        name, _, value = part.partition("=")
+        if name and value:
+            cookies[name] = value
+    for name in HINT_COOKIE_ORDER:
+        if cookies.get(name):
+            return cookies[name]
     return "未知"
 
 

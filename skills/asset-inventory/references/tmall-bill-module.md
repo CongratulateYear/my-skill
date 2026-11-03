@@ -4,6 +4,10 @@
 
 登录态默认由 `scripts/tmall_session.py` 从本机浏览器 cookie 库自动读取，取出含 HttpOnly 的完整 cookie，并用 `https://scm.tmall.com/loginStatus` 返回 `data: true` 校验后才发请求。用户不需要复制 fetch。
 
+校验不通过时不要交回人工：先跑 `scripts/ensure_login.py`（退出码 0=有效 / 3=需登录 / 1=出错），退出码为 3 才按 SKILL.md 的「登录态自愈」用 magpie-browser 在**当前已打开的浏览器**里复用（没有才新开）一个 `tgcwork.tmall.com` 标签登录——绝不新开浏览器实例、绝不把密码落盘；登录后用 `ensure_login.py --wait 30` 确认 `loggedIn: true` 再继续。仅当出现短信/滑块等验证码或用户明确拒绝自动登录时才停下让人工处理。
+
+XSRF：天猫实际下发的是 `XSRF-TOKEN`（部分环境为 `X-XSRF-TOKEN`），`build_headers()` 两个名字都接受。
+
 若用户主动提供一条有效 `queryBillDetail` fetch，则复用其中登录态（优先级更高），结算时间和支付时间可由命令行 `--write-off-*` / `--order-pay-*` 覆盖。默认执行范围是下表全部17个流程，而不是 fetch body 原有 `billType`。每个流程均覆盖为自己的固定 `billType`；所有商品效果数据导出改用 hosting 任务的 `bizType`/`bizScene`。只有用户明确限定单流程时才缩小范围。
 
 cookie 解密原理（macOS Chrome）：钥匙串 `Chrome Safe Storage` → `PBKDF2-HMAC-SHA1(salt=b"saltysalt", 1003, 16)` → `AES-128-CBC`（IV 为 16 个空格）→ 去 `v10` 前缀与 PKCS7 填充 → 当 cookie 库 `meta.version >= 24` 时再剥掉前 32 字节 SHA256(host)。`v20` 为 App-Bound Encryption，无法解密，遇到会明确报错。

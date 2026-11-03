@@ -5,7 +5,9 @@
 - 一次只处理一个店铺：登录态、下载目录、盘算文件、交付文件夹、状态文件全部按店铺隔离。
 - 店铺之间严格串行，前一个店铺完整跑完（下载 → 导入模板 → 交付 → 状态）才进入下一个。
 - 任一店铺失败立即停止后续店铺，已完成的店铺产物原样保留，可用 `--only` 或 `--skip-completed` 续跑。
-- 不接收、不保存密码：登录由调用者在浏览器里完成，本脚本只校验“当前登录态是否真的换成了这家店”。
+- 不接收、不保存密码：密码绝不落盘、绝不从钥匙串或 Chrome Login Data 挖；登录由 agent
+  用 magpie-browser 在【当前已打开的浏览器】里复用（没有才新开）tgcwork.tmall.com 标签、
+  驱动表单完成。本脚本只校验“当前登录态是否真的换成了这家店”。
 - 不写任何凭据：状态文件只记录店铺名、日期、完成进度和结果摘要。
 """
 from __future__ import annotations
@@ -82,13 +84,15 @@ def load_shops(path: Path) -> list[dict[str, Any]]:
 def session_snapshot() -> dict[str, Any]:
     """读取当前浏览器登录态（不打印、不落盘任何凭据）。"""
     sys.path.insert(0, str(SCRIPT_DIR))
-    import tmall_session  # noqa: PLC0415  (延迟导入，避免无登录态时也要加载解密依赖)
+    import ensure_login  # noqa: PLC0415  (延迟导入，避免无登录态时也要加载解密依赖)
 
-    headers = tmall_session.build_headers()
+    state = ensure_login.probe("chrome", "tgc.tmall.com")
     return {
-        "loggedIn": tmall_session.check_session(headers),
-        "hint": tmall_session.account_hint(headers),
-        "cookieCount": len(headers.get("cookie", "").split("; ")),
+        "loggedIn": bool(state.get("loggedIn")),
+        "hint": str(state.get("accountHint") or ""),
+        "cookieCount": int(state.get("cookieCount") or 0),
+        "reason": str(state.get("reason") or ""),
+        "action": str(state.get("action") or ""),
     }
 
 
@@ -293,6 +297,8 @@ def main() -> int:
             "loggedIn": snapshot.get("loggedIn"),
             "currentHint": snapshot.get("hint"),
             "cookieCount": snapshot.get("cookieCount"),
+            "reason": snapshot.get("reason"),
+            "action": snapshot.get("action"),
         }, ensure_ascii=False, indent=2))
         return 0 if snapshot.get("loggedIn") else EXIT_NEED_LOGIN
 
@@ -322,7 +328,14 @@ def main() -> int:
                     "status": "需要登录",
                     "shop": shop["shop"],
                     "account": shop["account"],
-                    "action": f"请在 Chrome 中登录店铺「{shop['shop']}」的天猫账号后重跑本命令",
+                    "reason": snapshot.get("reason"),
+                    "action": (
+                        "用 magpie-browser 在当前已打开的浏览器里打开 "
+                        f"https://tgcwork.tmall.com/login 登录店铺「{shop['shop']}」"
+                        f"（账号 {shop['account']}）的天猫账号"
+                        f"（复用已有标签，没有才 tab_new；不要新开浏览器、不要把密码落盘），"
+                        "登录后先用 ensure_login.py --wait 30 确认 loggedIn=true，再重跑本命令。"
+                    ),
                 }, ensure_ascii=False, indent=2))
                 return EXIT_NEED_LOGIN
             expected = shop.get("accountHint")
@@ -332,7 +345,11 @@ def main() -> int:
                     "shop": shop["shop"],
                     "expectedHint": expected,
                     "currentHint": hint,
-                    "action": "当前浏览器登录的不是这家店，请切换账号后重跑",
+                    "action": (
+                        "当前浏览器登录的不是这家店。用 magpie-browser 在该标签页退出并登录"
+                        f"店铺「{shop['shop']}」（账号 {shop['account']}），"
+                        "ensure_login.py --wait 30 确认后重跑本命令"
+                    ),
                 }, ensure_ascii=False, indent=2))
                 return EXIT_NEED_LOGIN
             if previous_hint is not None and hint == previous_hint and not args.reuse_downloads:
@@ -340,7 +357,11 @@ def main() -> int:
                     "status": "登录态没有切换",
                     "shop": shop["shop"],
                     "currentHint": hint,
-                    "action": "仍是上一个店铺的登录态，请先在浏览器切换到这家店的账号",
+                    "action": (
+                        "仍是上一个店铺的登录态。用 magpie-browser 在当前浏览器里退出该账号，"
+                        f"改登店铺「{shop['shop']}」（账号 {shop['account']}），"
+                        "ensure_login.py --wait 30 确认后再重跑本命令"
+                    ),
                 }, ensure_ascii=False, indent=2))
                 return EXIT_NEED_LOGIN
             previous_hint = hint

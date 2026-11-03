@@ -1,6 +1,6 @@
 ---
 name: asset-inventory
-description: 资产盘算工作流：默认直接复用本机浏览器已登录的天猫会话（无需用户发 fetch），只需给出结算时间和支付时间，即按固定顺序执行全部17个账单流程，创建下载任务、轮询、下载与安全解压，并把每类 Excel 写入盘算工作簿对应 Sheet、刷新公司汇总和费用归集；用户发起 fetch 时也可复用其中登录态与日期。支持用户明确限定单流程及中断后续跑；支持一次给出多个店铺，按用户给定顺序一个店铺接一个店铺串行执行（见“多店铺串行执行”）。公司汇总固定30列表头不得改变，店铺列取用户发送的店铺名称，公司汇总只按商品逐行列出并保留模板55行结构，所有商品效果数据导出仅由专属流程导入，其他流程不得覆盖。盘算文件名固定为 `店铺_结算开始_结算结束.xlsx`。适用于消费者体验提升服务、商品贷款/商品货款、交易补贴、交易佣金、先用后付、新疆物流集运、评价有礼、营销费用、商业化账户充值提现、投流/淘客/直播推广佣金、客服服务费、赔付追缴、处罚数据、出海增值服务费和所有商品效果数据导出。
+description: 资产盘算工作流：默认直接复用本机浏览器已登录的天猫会话（无需用户发 fetch），登录态失效时用 magpie-browser 在当前已打开的浏览器里自动登录（不开新浏览器、不落盘密码），只需给出结算时间和支付时间，即按固定顺序执行全部17个账单流程，创建下载任务、轮询、下载与安全解压，并把每类 Excel 写入盘算工作簿对应 Sheet、刷新公司汇总和费用归集；用户发起 fetch 时也可复用其中登录态与日期。支持用户明确限定单流程及中断后续跑；支持一次给出多个店铺，按用户给定顺序一个店铺接一个店铺串行执行（见“多店铺串行执行”）。公司汇总固定30列表头不得改变，店铺列取用户发送的店铺名称，公司汇总只按商品逐行列出并保留模板55行结构，所有商品效果数据导出仅由专属流程导入，其他流程不得覆盖。盘算文件名固定为 `店铺_结算开始_结算结束.xlsx`。适用于消费者体验提升服务、商品贷款/商品货款、交易补贴、交易佣金、先用后付、新疆物流集运、评价有礼、营销费用、商业化账户充值提现、投流/淘客/直播推广佣金、客服服务费、赔付追缴、处罚数据、出海增值服务费和所有商品效果数据导出。
 ---
 
 # 资产盘算
@@ -11,17 +11,49 @@ description: 资产盘算工作流：默认直接复用本机浏览器已登录�
 
 0. **店铺名称**取用户本条消息里发送的名称原文（例如「埔鸣--迎风部」或「埔鸣」），不做增删改；它同时用于公司汇总「店铺」列和盘算文件名前缀。用户没给名称时先问一句店铺名，不要自行编造。用户一次给了多个店铺时，按用户列出的先后顺序逐店执行，见“多店铺串行执行”。
 1. 登录态由脚本自动从本机浏览器读取（`scripts/tmall_session.py`：解密 Chrome cookie 库，取出含 HttpOnly 的完整 cookie），并用 `https://scm.tmall.com/loginStatus` 校验有效后才会发请求。
-2. 用户未明确限定流程时，按下表固定顺序执行全部17个流程。
-3. 每个流程使用技能配置的固定 `billType`（导出流程为 `bizType`+`bizScene`）和日期字段，依次查询、创建明细任务、轮询、获取签名地址、下载和安全解压。
-4. 将下载的 `.xlsx` 强制写入该流程对应 Sheet，不依赖下载文件名猜测。
-5. 在同一盘算文件上累积各流程结果；保存后验证目标 Sheet、写入行数、固定表头及 `#REF!`。
-6. 仅更新现有工作簿中与本次数据相关的值和公式；不会创建、删除或重建任何 Sheet，也不会自动打开工作簿。公式缓存默认不通过 LibreOffice 重写；只有用户明确要求时才可进行无界面重算。
+2. 校验不通过时**不要停下去找用户**：按下一节「登录态自愈」用 magpie-browser 在当前已打开的浏览器里自动完成登录，登录成功后再继续原流程。
+3. 用户未明确限定流程时，按下表固定顺序执行全部17个流程。
+4. 每个流程使用技能配置的固定 `billType`（导出流程为 `bizType`+`bizScene`）和日期字段，依次查询、创建明细任务、轮询、获取签名地址、下载和安全解压。
+5. 将下载的 `.xlsx` 强制写入该流程对应 Sheet，不依赖下载文件名猜测。
+6. 在同一盘算文件上累积各流程结果；保存后验证目标 Sheet、写入行数、固定表头及 `#REF!`。
+7. 仅更新现有工作簿中与本次数据相关的值和公式；不会创建、删除或重建任何 Sheet，也不会自动打开工作簿。公式缓存默认不通过 LibreOffice 重写；只有用户明确要求时才可进行无界面重算。
 
 若用户主动贴了一条 `queryBillDetail` fetch，则改用它提供的登录态和日期（fetch body 里的日期优先于缺省值），但仍可用命令行日期覆盖。fetch body 原有 `billType` 不限制执行范围。
 
 不要只解释参数，也不要再次询问是否执行。只有用户明确说“只跑某流程”时才传单一 `--module`。
 
-若 `loginStatus` 校验失败（浏览器里也没登录态了），提示用户在 Chrome 打开 <https://tgcwork.tmall.com/login> 登录一次再重试；这是唯一需要人工介入的情形。
+## 登录态自愈（未登录时自动登录）
+
+**判据永远来自脚本，不要靠肉眼或 cookie 猜测**：先跑
+
+```bash
+python3 /Users/rabbit/.agents/skills/asset-inventory/scripts/ensure_login.py
+```
+
+它只输出一个 JSON 对象并以退出码区分状态：`0`=登录态有效（直接继续原流程，**不要再打开登录页**）；`3`=需要登录（`reason` 为 `no-cookie` / `expired` / `wrong-account`）；`1`=脚本自身出错。**只有退出码为 3 时才执行下面的登录动作**，并且优先照抄 JSON 里的 `action` 文案（它已经写明该复用什么标签）。
+
+多店换号时加 `--expect-account <账号提示>`：即使当前有有效登录态，只要不是这家店的账号也会返回 `reason: wrong-account`，避免把上一家店的会话误当成这家店。
+
+0. **先确认有浏览器可接管**：调 `browser` 工具 `action: "browsers"`。
+   - 返回已有会话（如 `b5 Chrome 156`）→ 直接用它，**不要碰其他浏览器**。
+   - 返回为空（Chrome 没启动）→ 先尝试 `open -a "Google Chrome"` 启动用户本机那个 Chrome（同一个 profile，不是新装/新 profile 的实例），然后每 2 秒调一次 `browsers`，最多等 20 秒等 Magpie 扩展连上。
+   - 20 秒后仍为空（扩展没装/没启用）→ 只提示用户检查 Magpie Browser 扩展，不要自己另起浏览器或另建 profile。
+1. **复用当前浏览器，绝不新开浏览器**：只用 magpie-browser MCP 的 `browser` 工具。先 `tabs` 找有没有 `tgcwork.tmall.com` 标签，**有就 `tab_select` 复用它**；没有再 `tab_new`（带 url）一个标签页 —— `tab_new` 就是在“当前这个已打开的浏览器里新开窗口”，符合要求。不要用 chrome-devtools，不要 `open -a`（除非第 0 步的“浏览器没开”场景，且只开用户原本那个 Chrome），不要启动第二个浏览器实例。
+2. **判断登录框状态**：`snapshot`（interactive）读登录页，普通登录 tab 的 iframe 里有「请输入账号名/手机号/邮箱」「请输入登录密码」「登录」三个元素。
+   - 两个输入框都已有值（用户或密码管理器预填）→ 直接进入第 4 步，**不要改动内容**。
+   - 输入框为空 → 进入第 3 步。
+3. **凭据来源只有两个，都不落盘**：用户在本轮对话里已给出账号/密码就用它；否则用 `ask_user_question` 问一次（账号 + 密码），说明只用于本次填表。**绝不把密码写进技能文件、状态文件、日志或回复**；**绝不尝试从 macOS 钥匙串、Chrome `Login Data`、`security` 或其他脚本里挖密码**。
+4. 用 `type`/`fill` 按 ref 填表，再用 `click` 点「登录」按钮（真实点击，不要用 `evaluate` 合成点击）。
+5. **登录要验证，不能假定成功**：刚点完登录时 cookie 可能还没落库，用
+
+   ```bash
+   python3 /Users/rabbit/.agents/skills/asset-inventory/scripts/ensure_login.py --wait 30
+   ```
+
+   轮询到 `loggedIn: true`（或退出码 0）才算成功。仍为 3 时：`snapshot` 看页面是否有短信/滑块/二次验证，有就停下来让用户在浏览器里自己过（不绕过验证码）；无提示则检查账号密码是否输错，最多重试 2 次。
+6. 登录成功后才回到原流程重跑原命令。多店场景下每换一家店走一遍本节，并把 `ensure_login.py` 输出的 `accountHint` 与该店配置的 `accountHint` 比对，确认确实换了账号。
+
+若用户明确要求“不要自动登录”，则退回旧行为：只提示用户在浏览器里登录一次后重试。除此之外，只有遇到短信/滑块等验证码时才需要人工介入。
 
 ## 不可破坏的工作簿约束
 
@@ -115,7 +147,7 @@ description: 资产盘算工作流：默认直接复用本机浏览器已登录�
 
 ## 执行命令
 
-解释器要求：需 Python 3.12（脚本含 PEP 701 多行 f-string）且已安装 `cryptography`、`openpyxl`。系统自带 `python3` 常缺依赖，可先 `uv venv /tmp/aivenv --python 3.12 && uv pip install --python /tmp/aivenv/bin/python cryptography openpyxl`，再把下文的 `python3` 换成 `/tmp/aivenv/bin/python`。
+解释器要求：Python 3.11+（已移除 PEP 701 多行 f-string，3.11 与 3.12 均已实测可解析运行）且已安装 `cryptography`、`openpyxl`。若当前 `python3` 缺依赖，可先 `uv venv /tmp/aivenv --python 3.12 && uv pip install --python /tmp/aivenv/bin/python cryptography openpyxl`，再把下文的 `python3` 换成 `/tmp/aivenv/bin/python`。
 
 默认执行全部17个流程（自动复用本机浏览器登录态，只需店铺名和日期）：
 
@@ -146,11 +178,13 @@ python3 /Users/rabbit/.agents/skills/asset-inventory/scripts/tmall_bill_download
   --output-dir /path/to/outputs
 ```
 
-想先确认登录态是否可用：
+想先确认登录态是否可用（唯一可信判据，退出码 0=有效 / 3=需登录 / 1=脚本出错）：
 
 ```bash
-python3 /Users/rabbit/.agents/skills/asset-inventory/scripts/tmall_session.py --json
+python3 /Users/rabbit/.agents/skills/asset-inventory/scripts/ensure_login.py
 ```
+
+只想要原始诊断时用 `scripts/tmall_session.py --json`（输出为纯 JSON，日志已移到 stderr）。
 
 仍支持用户贴 fetch 的老用法，`--fetch-file` 与命令行日期可混用：
 
@@ -205,20 +239,20 @@ python3 /Users/rabbit/.agents/skills/asset-inventory/scripts/tmall_session.py --
 
 - 店铺顺序＝用户列出的顺序，不重排、不合并、不去重。
 - 店铺名取用户原文，各自用于该店的 `公司汇总!A` 列与盘算文件名前缀。
-- 只接收店铺名、账号和日期，**不接收也不保存密码**：密码由用户在浏览器里自己输入，脚本只校验“当前登录态是否真的换成了这家店”。
+- runner 本身只接收店铺名、账号和日期，**它自己不接收也不保存密码**：登录要么复用浏览器现有会话，要么由 agent 按「登录态自愈」在浏览器里填表完成（密码只在本轮内存/表单里，不写入任何文件、状态或日志）。
 - 两种给店方式（可混用，`--shop` 追加在清单之后）：
   - 命令行：`--shop "店名,账号,支付开始,支付结束[,结算开始,结算结束[,账号提示]]"`，可重复；第5/6段省略时结算区间回落到支付区间。
   - JSON 清单（`--shops-file`）：`{"shops":[{"shop":"店名","account":"账号","orderPayStart":"YYYY-MM-DD","orderPayEnd":"YYYY-MM-DD","writeOffStart":"YYYY-MM-DD","writeOffEnd":"YYYY-MM-DD","accountHint":"可选"}]}`，也接受裸数组。
 
 ### 逐店登录闸门（关键）
 
-每进入一个店铺前后，runner 先用 `scripts/tmall_session.py` 读本机浏览器登录态并取账号提示（cookie 里的 `tracknick`/`lgc`），然后：
+每进入一个店铺前后，runner 先用 `scripts/ensure_login.py` 的逻辑读本机浏览器登录态并取账号提示（cookie 里的 `tracknick`/`lgc`/`cookie17`/`unb`，空值跳过），然后：
 
-1. 未登录 → 停下并输出 `{"status":"需要登录","shop":...,"account":...,"action":"请在 Chrome 中登录店铺「X」的天猫账号后重跑本命令"}`（退出码 3）。此时必须让用户在 Chrome 打开 <https://tgcwork.tmall.com/login> 手工登录该店账号，不要试图代填密码。
-2. 该店配置了 `accountHint` 但当前提示不一致 → 输出 `{"status":"登录态与店铺不匹配",...}` 并停下（说明浏览器里还是别的账号）。
-3. 与上一个已跑店铺的提示相同 → 输出 `{"status":"登录态没有切换",...}` 并停下（说明用户没换账号）。
+1. 未登录（`reason` 为 `no-cookie`/`expired`）→ runner 输出 `{"status":"需要登录","shop":...,"account":...,"action":...}` 并以退出码 3 结束。此时**不要直接把球踢回给用户**：按「登录态自愈」用 magpie-browser 在当前已打开的浏览器里登录该店账号（复用已有 `tgcwork.tmall.com` 标签，没有才 `tab_new`），然后用 `ensure_login.py --wait 30` 确认 `loggedIn: true`，再重跑同一条 runner 命令从该店继续。
+2. 该店配置了 `accountHint` 但当前提示不一致 → 输出 `{"status":"登录态与店铺不匹配",...}` 并停下（说明浏览器里还是别的账号），走「登录态自愈」换成这家店的账号。
+3. 与上一个已跑店铺的提示相同 → 输出 `{"status":"登录态没有切换",...}` 并停下（说明用户没换账号），同上处理。
 
-每次需要用户切换账号时，只输出“下一家店是哪个、要用哪个账号登录”，然后结束本轮；用户登录后重跑同一条命令即可从该店继续（已完成的店铺不会重跑，见 `--skip-completed`）。
+自动登录完成后重跑同一条命令即可从该店继续（已完成的店铺不会重跑，见 `--skip-completed`）。只有登录页出现短信/滑块等需要人过的验证码，或用户明确说“不要自动登录”时，才停下让用户自己在浏览器里点。
 
 ### 每店产物与批次状态
 
@@ -239,11 +273,11 @@ python3 /Users/rabbit/.agents/skills/asset-inventory/scripts/multi_shop_runner.p
 python3 /Users/rabbit/.agents/skills/asset-inventory/scripts/multi_shop_runner.py \
   --shops-file /path/to/shops.json --output-root /path/to/outputs
 
-# 先确认当前浏览器登录的是哪个账号
+# 先确认当前浏览器登录的是哪个账号（与 ensure_login.py 同源判定）
 python3 /Users/rabbit/.agents/skills/asset-inventory/scripts/multi_shop_runner.py --check-login
 ```
 
-- `--check-login`：只输出当前登录态 `{"loggedIn":true,"currentHint":"...","cookieCount":N}` 并以退出码 3/0 结束，用来判断“现在该不该让用户换账号”。
+- `--check-login`：只输出当前登录态 `{"loggedIn":true,"currentHint":"...","cookieCount":N}` 并以退出码 3/0 结束，用来判断“现在该不该换账号”。需要下一步动作建议时用 `scripts/ensure_login.py`（多返回 `reason`/`action`/`hasXsrf`，并可 `--wait` 等 cookie 落库）。
 - `--skip-completed`：跳过批次状态里已 `ok` 的店铺，用于登录闸门中断后的续跑。
 - `--only 店名`（可重复）：只跑指定店铺，仍按清单顺序。
 - `--continue-on-error`：某店失败后继续下一店；**默认不继续**——某店失败立即停止后续店铺，已完成店铺的产物和批次状态全部保留。
@@ -299,4 +333,6 @@ body: {"pageNo":N,"pageSize":50,"startDateTime":<毫秒>,"endDateTime":<毫秒>,
 ## 参考
 
 - [天猫账单模块与盘算映射](references/tmall-bill-module.md)
+- 登录态闸门（唯一入口，含 `reason`/`action`/`--wait`）：`scripts/ensure_login.py`
 - 多店铺串行执行：`scripts/multi_shop_runner.py`
+- 浏览器 cookie 解密与会话校验：`scripts/tmall_session.py`
