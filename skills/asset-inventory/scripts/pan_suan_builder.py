@@ -657,7 +657,7 @@ def rebuild_summary(wb, shop_name: str | None = None) -> int:
         "投流推广佣金": lambda r: sumifs_formula(r, "投流推广佣金", "C", "E", ranges["投流推广佣金"], -1),
         "淘客推广佣金": lambda r: sumifs_formula(r, "淘客推广佣金", "E", "G", ranges["淘客推广佣金"], -1),
         "直播推广佣金": lambda r: sumifs_formula(r, "直播推广佣金", "E", "G", ranges["直播推广佣金"], -1),
-        "罚款": lambda r: sumifs_formula(r, "处罚数据", "J", "G", ranges["处罚数据"]),
+        "罚款": lambda r: sumifs_formula(r, "处罚数据", "K", "H", ranges["处罚数据"]),
     }
     for offset, product in enumerate(product_ids, start=2):
         summary.cell(offset, header_col["商品ID"], product)

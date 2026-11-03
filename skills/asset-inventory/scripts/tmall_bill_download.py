@@ -895,9 +895,11 @@ def query_total(value: Any) -> Any:
 
 CST = timezone(timedelta(hours=8))
 PUNISHMENT_HEADERS = [
-    "店铺", "处罚内容", "主订单号", "处罚时间", "违规类型", "违规事件",
+    "店铺", "类型", "处罚内容", "主订单号", "处罚时间", "违规类型", "违规事件",
     "商品id", "商品标题", "运营", "处罚金额",
 ]
+# 类型列：punish=违规记录归为「处罚数据」，compensation=赔付记录归为「赔付追缴」
+PUNISHMENT_TAB_LABELS = {"punish": "处罚数据", "compensation": "赔付追缴"}
 WORKBOOK_WRITER = """
 import json, sys
 from openpyxl import Workbook
@@ -986,6 +988,7 @@ def rules_center_row(tab_type: str, item: dict[str, Any], shop_name: str | None)
     content = item.get("punishValue") or item.get("remark") or item.get("reason")
     return [
         shop_name,
+        PUNISHMENT_TAB_LABELS.get(tab_type),
         content,
         text_identifier(item.get("orderNo")),
         rules_center_time_text(item),
