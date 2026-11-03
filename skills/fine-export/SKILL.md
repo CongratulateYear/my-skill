@@ -51,6 +51,8 @@ python3 scripts/fine_export.py \
 4. 两个 tab 各自按 `pageNo` 翻页（`POST https://tgc.tmall.com/ds/api/v1/rules-center/pageList`，Referer 为 rules-center 页面，pageSize 50，最多 60 页），按 `paginator.items`（回退 `total`）取满；取不满报错停止，**不写残缺文件**。
 5. 行映射 → 写出 `<safe_prefix(店铺)>_罚款_<pay_start>_<pay_end>.xlsx`，Sheet 名「处罚数据」。
 
+分页策略固定为 **每页 50 条**，`punish` 与 `compensation` 分别从第 1 页取满后合并。接口虽然允许最大 100 条，但本次实测较大分页更容易出现系统异常或连接断开，因此保持 50；不要自动尝试 100，也不要在翻页途中切换分页大小，以免漏取或重复。最多 60 页及取不满报错、不写残缺文件的规则保持不变。
+
 支付日期 = 处罚时间范围：开始日转北京时间毫秒 `00:00:00.000`，结束日 `23:59:59.999`（CST = UTC+8）。
 
 ## 登录态自愈（未登录时自动登录）

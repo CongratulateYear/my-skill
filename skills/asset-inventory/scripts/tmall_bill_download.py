@@ -46,6 +46,8 @@ RULES_CENTER_REFERER = (
     "https://tgc.tmall.com/ds/page/supplier/rules-center"
     "?c2mNavigatorShellPage=1&c2mNavigatorPageOpener=0"
 )
+# 固定每页 50 条：实测 100 条虽被接口接受，但更易出现系统异常或连接断开。
+# punish / compensation 均保持此大小翻页，不在运行中切换分页大小。
 RULES_CENTER_PAGE_SIZE = 50
 RULES_CENTER_MAX_PAGES = 60
 RULES_CENTER_TABS = ("punish", "compensation")

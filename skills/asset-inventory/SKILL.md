@@ -107,6 +107,8 @@ python3 /Users/rabbit/.agents/skills/asset-inventory/scripts/ensure_login.py
 
 第15个流程 `punishment-data`（处罚数据）不使用 `DETAIL_BILL`，也不查询 `queryBillDetail`：它直接调用 rules-center 两个接口 —— `tabType=punish`（违规记录）与 `tabType=compensation`（赔付记录），日期用**处罚时间**（对应 `orderPayTime` 的起止日期，转成北京时间毫秒时间戳 `startDateTime`/`endDateTime`，结束日取 `23:59:59.999`）。单个 tab 按 `pageSize=50` 翻页，直到已取行数不小于响应 `paginator.items`（接口用 `items` 而非 `total`；也可参考 `paginator.pages`），未取满即报错停止；两个 tab 的数据**合并**后才是完整的处罚数据。
 
+分页策略固定为 **每页 50 条**，`punish` 与 `compensation` 分别从第 1 页取满后合并。接口虽然允许最大 100 条，但本次实测较大分页更容易出现系统异常或连接断开，因此保持 50；不要自动尝试 100，也不要在翻页途中切换分页大小，以免漏取或重复。最多 60 页及取不满报错、不写残缺文件的规则保持不变。
+
 - 写入 `处罚数据` Sheet 的11列映射：`店铺` = `--shop-name`；`类型` = `punish`→`处罚数据`、`compensation`→`赔付追缴`（店铺右侧）；`处罚内容` = `punishValue`（缺失回退 `remark`/`reason`）；`主订单号` = `orderNo`；`处罚时间` = `punishTime`（缺失回退 `gmtFinish`/`gmtCreate`）按北京时间格式化为 `YYYY-MM-DD HH:MM:SS`；`违规类型` = `violationType`；`违规事件` = `violationEvent`；`商品id` 三级回退 `extend.itemId` → `extend.extendInfo.itemId` → `punishDimensionValue`；`商品标题` 留空（接口不返回标题，不臆造）；`运营` 留空；`处罚金额` = `punishAmount ÷ 100`（接口单位为分，写入按元）。
 - 0 元记录（如「单一商品下架/滥发信息」只有 `punishDimensionValue` 携带商品id）同样写入，保证处罚明细完整；`罚款` 在公司汇总中按商品ID用 SUMIFS 逐商品归集，总计行对这一列求和（不再取 `处罚数据` 整表合计）。
 
