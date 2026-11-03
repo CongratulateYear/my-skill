@@ -88,31 +88,29 @@ def load_accounts(path: Path) -> list[dict[str, Any]]:
     return normalized
 
 
-def session_snapshot() -> dict[str, Any]:
-    """读取当前浏览器登录态与 token（不打印、不落盘任何凭据）。"""
+def session_snapshot(browser: str = "chrome") -> dict[str, Any]:
+    """读取当前浏览器登录态与 token（不打印、不落盘任何凭据）。
+
+    统一走 ensure_login.probe，避免和登录闸门各写一套判据。
+    """
+    import ensure_login
+
+    state = ensure_login.probe(browser, tmall_session_domain())
+    return {
+        "loggedIn": state["loggedIn"],
+        "hint": state["accountHint"],
+        "cookieCount": state["cookieCount"],
+        "hasXsrfToken": state["hasXsrf"],
+        "reason": state["reason"],
+        "detail": state.get("detail", ""),
+        "action": state.get("action", ""),
+    }
+
+
+def tmall_session_domain() -> str:
     import tmall_session
 
-    try:
-        headers = tmall_session.build_headers()
-    except tmall_session.SessionError as exc:
-        return {
-            "loggedIn": False,
-            "hint": "",
-            "cookieCount": 0,
-            "hasXsrfToken": False,
-            "reason": "no-cookie",
-            "detail": str(exc).splitlines()[0] if str(exc) else "",
-        }
-    cookie = headers.get("cookie", "")
-    parts = [part for part in cookie.split("; ") if "=" in part]
-    logged_in = tmall_session.check_session(headers)
-    return {
-        "loggedIn": logged_in,
-        "hint": tmall_session.account_hint(headers),
-        "cookieCount": len(parts),
-        "hasXsrfToken": bool(headers.get("x-xsrf-token")),
-        "reason": "logged-in" if logged_in else "expired",
-    }
+    return tmall_session.DEFAULT_DOMAIN
 
 
 def fine_file_for(account: dict[str, Any], account_dir: Path) -> Path:
@@ -128,7 +126,7 @@ def run_step(command: list[str], log_path: Path) -> tuple[int, str]:
     return completed.returncode, output
 
 
-def run_account(account: dict[str, Any], output_root: Path) -> dict[str, Any]:
+def run_account(account: dict[str, Any], output_root: Path, browser: str = "chrome") -> dict[str, Any]:
     name = account["shop"]
     prefix = safe_prefix(name)
     account_dir = (output_root / prefix).resolve()
@@ -150,6 +148,7 @@ def run_account(account: dict[str, Any], output_root: Path) -> dict[str, Any]:
         "--shop-name", name,
         "--pay-start", account["payStart"], "--pay-end", account["payEnd"],
         "--output-dir", str(account_dir),
+        "--browser", browser,
     ]
     code, output = run_step(command, logs / "export.log")
     result["stages"]["export"] = {
@@ -158,6 +157,7 @@ def run_account(account: dict[str, Any], output_root: Path) -> dict[str, Any]:
         "log": str(logs / "export.log"),
     }
     if code == EXIT_NEED_LOGIN:
+        # fine_export.py 与 ensure_login.py 共用退出码 3 = 需要登录。
         result["needLogin"] = True
         result["ok"] = False
         return result
@@ -198,6 +198,8 @@ def parse_args() -> argparse.Namespace:
                    metavar="店名,账号,支付开始,支付结束[,账号提示]",
                    help="直接在命令行给出一个账户；可重复，顺序即执行顺序")
     p.add_argument("--output-root", type=Path, help="多账户输出根目录，每个账户一个子目录")
+    p.add_argument("--browser", default="chrome",
+                   help="读取哪个浏览器的 cookie；会透传给 fine_export.py（默认 chrome）")
     p.add_argument("--only", action="append", default=[], help="只跑指定店铺（可重复），按清单顺序")
     p.add_argument("--skip-completed", action="store_true", help="跳过批次状态里已完成的账户")
     p.add_argument("--skip-login-check", action="store_true", help="跳过登录态校验（仅调试用）")
@@ -218,13 +220,16 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     if args.check_login:
-        snapshot = session_snapshot()
+        snapshot = session_snapshot(args.browser)
         print(json.dumps({
             "loggedIn": snapshot.get("loggedIn"),
             "currentHint": snapshot.get("hint"),
             "cookieCount": snapshot.get("cookieCount"),
             "hasXsrfToken": snapshot.get("hasXsrfToken"),
             "reason": snapshot.get("reason"),
+            "detail": snapshot.get("detail", ""),
+            "action": snapshot.get("action", ""),
+            "loginUrl": "https://tgcwork.tmall.com/login",
         }, ensure_ascii=False, indent=2))
         return EXIT_OK if snapshot.get("loggedIn") else EXIT_NEED_LOGIN
 
@@ -247,7 +252,7 @@ def main() -> int:
     for index, account in enumerate(selected, start=1):
         print(f"\n===== [{index}/{len(selected)}] {account['shop']}（{account['account'] or '账号未填'}）=====")
         if not args.skip_login_check:
-            snapshot = session_snapshot()
+            snapshot = session_snapshot(args.browser)
             hint = str(snapshot.get("hint") or "")
             if not snapshot.get("loggedIn"):
                 print(json.dumps({
@@ -294,7 +299,7 @@ def main() -> int:
             previous_hint = hint
             print(f"登录态校验通过：当前账号 {hint}")
 
-        result = run_account(account, output_root)
+        result = run_account(account, output_root, args.browser)
         state.setdefault("accounts", [])
         state["accounts"] = [item for item in state["accounts"] if item.get("shop") != account["shop"]]
         state["accounts"].append(result)
@@ -307,7 +312,14 @@ def main() -> int:
                 "status": "需要登录",
                 "shop": account["shop"],
                 "account": account["account"],
-                "action": "导出过程中登录态失效，请重新登录该账号后重跑本命令",
+                "reason": "expired",
+                "action": (
+                    "导出过程中登录态失效。用 magpie-browser 在当前已打开的浏览器里复用现有的 "
+                    "tgcwork.tmall.com 标签（没有才 tab_new，仍在当前浏览器里；不要新开浏览器、"
+                    f"不要把密码落盘）重新登录店铺「{account['shop']}」"
+                    f"（账号 {account['account'] or '未填'}），"
+                    "登录后用 scripts/ensure_login.py --wait 30 确认 loggedIn=true，再重跑本命令续跑。"
+                ),
             }, ensure_ascii=False, indent=2))
             return EXIT_NEED_LOGIN
         else:

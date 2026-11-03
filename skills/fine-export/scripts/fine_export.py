@@ -50,6 +50,12 @@ TAB_TYPE_LABELS = {"punish": "处罚数据", "compensation": "赔付追缴"}
 DEFAULT_SPREADSHEET_PYTHON = Path(
     "/Users/rabbit/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3"
 )
+# 常见的手工建库位置：codex 主运行时缺失时按序回退（与 asset-inventory 保持一致）。
+EXTRA_SPREADSHEET_PYTHONS = (
+    Path("/tmp/aivenv/bin/python"),
+    Path.home() / ".local/bin/python3.12",
+    Path.home() / ".local/bin/python3.13",
+)
 WORKBOOK_WRITER = """
 import json, sys
 from openpyxl import Workbook
@@ -66,7 +72,8 @@ wb.save(sys.argv[2])
 
 EXIT_OK = 0
 EXIT_ERROR = 1
-EXIT_NEED_LOGIN = 2
+# 与 ensure_login.py / multi_account_runner.py 统一：3 = 需要登录（不是脚本错误）。
+EXIT_NEED_LOGIN = 3
 
 
 class AuthenticationError(RuntimeError):
@@ -229,7 +236,7 @@ def load_fetch_headers(path: Path) -> dict[str, str]:
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36",
     )
-    print("已读取登录态：fetch 文件")
+    print("已读取登录态：fetch 文件", file=sys.stderr)
     return headers
 
 
@@ -253,13 +260,21 @@ def check_session(headers: dict[str, str]) -> bool:
 
 def token_state(headers: dict[str, str]) -> dict[str, Any]:
     """脱敏的 token/账号诊断；绝不输出 token 或 cookie 值本身。"""
+    import tmall_session
+
     cookie = headers.get("cookie", "")
     parts = [part for part in cookie.split("; ") if "=" in part]
     names = {part.split("=", 1)[0] for part in parts}
-    account = "未知"
+    # 空值必须跳过：天猫有时下发空的 `lgc=`/`sn=`，先命中空值会把账号显示成空字符串。
+    values: dict[str, str] = {}
     for part in parts:
-        if part.startswith("tracknick=") or part.startswith("lgc="):
-            account = part.split("=", 1)[1]
+        name, _, value = part.partition("=")
+        if name and value:
+            values[name] = value
+    account = "未知"
+    for name in tmall_session.HINT_COOKIE_ORDER:
+        if values.get(name):
+            account = values[name]
             break
     return {
         "account": account,
@@ -459,7 +474,9 @@ def find_spreadsheet_python() -> Path:
     configured = os.environ.get("CODEX_SPREADSHEET_PYTHON")
     if configured:
         candidates.append(Path(configured).expanduser())
-    candidates.extend([DEFAULT_SPREADSHEET_PYTHON, Path(sys.executable)])
+    candidates.extend(
+        [DEFAULT_SPREADSHEET_PYTHON, *EXTRA_SPREADSHEET_PYTHONS, Path(sys.executable)]
+    )
     checked: set[Path] = set()
     for candidate in candidates:
         candidate = candidate.resolve()
@@ -529,23 +546,49 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def run_check_login(args: argparse.Namespace) -> int:
+    """脱敏诊断：退出码 0=就绪 / 3=需要登录 / 1=环境错误，与 ensure_login.py 统一。"""
+    import ensure_login
     import tmall_session
 
-    try:
-        headers = resolve_headers(args)
-    except tmall_session.SessionError as exc:
-        print(json.dumps({"loggedIn": False, "reason": str(exc)}, ensure_ascii=False, indent=2))
-        return EXIT_NEED_LOGIN
-    logged_in = check_session(headers)
-    state = token_state(headers)
+    if args.fetch_file is not None:
+        # 显式 fetch 路径：不读浏览器 cookie 库，直接用文件里的头做校验。
+        try:
+            headers = load_fetch_headers(args.fetch_file.expanduser().resolve())
+        except (OSError, ValueError) as exc:
+            print(json.dumps({
+                "loggedIn": False,
+                "reason": "fetch-file",
+                "detail": str(exc).splitlines()[0] if str(exc) else "无法读取 fetch 文件",
+                "action": "检查 --fetch-file 路径与内容，或改用默认的浏览器 cookie 登录态。",
+                "loginUrl": ensure_login.LOGIN_URL,
+            }, ensure_ascii=False, indent=2))
+            return EXIT_NEED_LOGIN
+        state = token_state(headers)
+        ok = check_session(headers)
+        print(json.dumps({
+            "loggedIn": ok,
+            "reason": "logged-in" if ok else "expired",
+            "account": state["account"],
+            "cookieCount": state["cookieCount"],
+            "hasXsrfToken": state["hasXsrfToken"],
+            "source": "fetch-file",
+            "loginUrl": ensure_login.LOGIN_URL,
+        }, ensure_ascii=False, indent=2))
+        return EXIT_OK if ok and state["hasXsrfToken"] else EXIT_NEED_LOGIN
+
+    probed = ensure_login.probe(args.browser, tmall_session.DEFAULT_DOMAIN)
     print(json.dumps({
-        "loggedIn": logged_in,
-        "account": state["account"],
-        "cookieCount": state["cookieCount"],
-        "hasTbToken": state["hasTbToken"],
-        "hasXsrfToken": state["hasXsrfToken"],
+        "loggedIn": probed["loggedIn"],
+        "reason": probed["reason"],
+        "detail": probed["detail"],
+        "account": probed["accountHint"],
+        "cookieCount": probed["cookieCount"],
+        "hasXsrfToken": probed["hasXsrf"],
+        "action": probed["action"],
+        "source": f"browser:{args.browser}",
+        "loginUrl": ensure_login.LOGIN_URL,
     }, ensure_ascii=False, indent=2))
-    return EXIT_OK if logged_in and state["hasXsrfToken"] else EXIT_NEED_LOGIN
+    return EXIT_OK if probed["loggedIn"] and probed["hasXsrf"] else EXIT_NEED_LOGIN
 
 
 def dry_run_plan(args: argparse.Namespace) -> dict[str, Any]:
@@ -596,7 +639,7 @@ def main(argv: list[str] | None = None) -> int:
         raise AuthenticationError(
             "登录态校验失败：请在当前浏览器里打开 https://tgcwork.tmall.com/login 重新登录"
             "（复用已有标签，不要新开浏览器），或用 "
-            "/Users/rabbit/.agents/skills/asset-inventory/scripts/ensure_login.py --wait 30 "
+            f"{SCRIPT_DIR / 'ensure_login.py'} --wait 30 "
             "确认 loggedIn=true 后重试"
         )
     require_token(headers)
@@ -638,9 +681,13 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    import tmall_session  # SessionError 是 RuntimeError 子类，必须先于通用分支拦截
+
     try:
         raise SystemExit(main())
-    except AuthenticationError as exc:
+    except (AuthenticationError, tmall_session.SessionError) as exc:
+        # SessionError = 浏览器里根本没有可用的登录 cookie，同样属于「需要登录」（3），
+        # 不是脚本环境错误（1）；否则调用方会把登录问题误判成导出失败。
         print(f"错误：{exc}", file=sys.stderr)
         raise SystemExit(EXIT_NEED_LOGIN)
     except (ValueError, RuntimeError, TimeoutError, OSError) as exc:
