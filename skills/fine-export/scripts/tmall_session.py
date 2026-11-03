@@ -285,7 +285,7 @@ def account_hint(headers: dict[str, str]) -> str:
     """Non-secret identity hint (login nick) for diagnostics.
 
     Empty values are skipped on purpose: tmall leaves `lgc=`/`sn=` blank on some
-    sessions, and a blank hint would silently disable the multi-account gate.
+    sessions, and a blank hint would silently disable the multi-shop / multi-account gate.
     """
     cookies: dict[str, str] = {}
     for part in headers.get("cookie", "").split("; "):
