@@ -34,8 +34,8 @@ try:
     from openpyxl.worksheet.table import Table, TableStyleInfo
 except ImportError as exc:  # pragma: no cover - environment issue
     raise SystemExit(
-        "缺少 openpyxl。请使用 Codex 工作区 Python 运行此脚本："
-        "/Users/rabbit/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3"
+        "缺少 openpyxl。请使用带 openpyxl 的 Python 运行此脚本，例如："
+        r"C:\Users\Administrator\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe"
     ) from exc
 
 TARGET_ALIASES = OrderedDict([
@@ -148,6 +148,7 @@ def parse_args() -> argparse.Namespace:
         help="店铺名称，取自用户发送的名称，例如 埔鸣--迎风部 或 埔鸣；写入公司汇总「店铺」列",
     )
     p.add_argument("--json", action="store_true", help="以JSON输出合并摘要")
+    p.add_argument("--result-json", type=Path, help="成功后原子写入独立的 schemaVersion=1 JSON 结果文件")
     p.add_argument("--recalculate", action="store_true", help="仅在用户明确要求时，以 LibreOffice 无界面生成公式缓存；默认不重写工作簿")
     # Backward-compatible no-op: recalculation is opt-in.
     p.add_argument("--no-recalculate", action="store_true", help=argparse.SUPPRESS)
@@ -734,7 +735,7 @@ def recalculate_with_libreoffice(output: Path, fixed_headers: list[Any]) -> bool
     configured = os.environ.get("SOFFICE_PATH")
     candidates = [
         Path(configured).expanduser() if configured else None,
-        Path("/Users/rabbit/.cache/codex-runtimes/codex-primary-runtime/dependencies/bin/override/soffice"),
+        Path('D:\\dsh\\resources\\app.asar.unpacked\\dsh\\node_modules\\@deepseek-ai\\libreoffice-kit-win32-x64\\program\\program\\soffice.exe'),
         Path(shutil.which("soffice")) if shutil.which("soffice") else None,
         Path(shutil.which("libreoffice")) if shutil.which("libreoffice") else None,
     ]
@@ -953,12 +954,62 @@ def merge(
     }
 
 
+def prepare_result_json(path: Path, protected_paths: Iterable[Path]) -> Path:
+    """Validate a dedicated result destination and invalidate any old success.
+
+    Resolve the parent once, but never follow a result-file symlink.  Requiring
+    a JSON filename also prevents a typo from deleting a workbook at startup.
+    """
+    requested = path.expanduser().absolute()
+    if requested.is_symlink():
+        raise ValueError(f"结果JSON不能是符号链接：{requested}")
+    destination = requested.parent.resolve() / requested.name
+    if destination.suffix.lower() != ".json":
+        raise ValueError("结果JSON必须使用 .json 扩展名")
+    if destination.exists() and not destination.is_file():
+        raise ValueError(f"结果JSON不是普通文件：{destination}")
+    for protected in protected_paths:
+        resolved = protected.expanduser().resolve()
+        if destination == resolved or (
+            destination.exists() and resolved.exists() and destination.samefile(resolved)
+        ):
+            raise ValueError(f"结果JSON不能覆盖模板、输出或输入路径：{destination}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    # A failed merge must never leave a previous run's success report behind.
+    destination.unlink(missing_ok=True)
+    return destination
+
+
+def write_result_json(destination: Path, result: dict[str, Any]) -> None:
+    """Publish the versioned result only after the workbook passed verification."""
+    payload = json.dumps({**result, "schemaVersion": 1}, ensure_ascii=False, indent=2) + "\n"
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", prefix=f".{destination.name}.",
+            suffix=".tmp", dir=destination.parent, delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def main() -> int:
     args = parse_args()
+    result_path = prepare_result_json(
+        args.result_json, [args.template, args.output, *args.input],
+    ) if args.result_json is not None else None
     result = merge(
         args.template, args.input, args.output, args.strict, args.recalculate and not args.no_recalculate,
         args.expected_target, args.allow_empty_target, args.shop_name,
     )
+    if result_path is not None:
+        write_result_json(result_path, result)
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:

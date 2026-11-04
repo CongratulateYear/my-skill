@@ -173,15 +173,11 @@ QUERY_PATH = "/ds/api/v1/fbi/bill/queryBillDetail"
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 PAN_SUAN_BUILDER = Path(__file__).resolve().with_name("pan_suan_builder.py")
 DEFAULT_PAN_SUAN_TEMPLATE = SKILL_ROOT / "assets" / "盘算模板.xlsx"
-DEFAULT_SPREADSHEET_PYTHON = Path(
-    "/Users/rabbit/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3"
-)
+DEFAULT_SPREADSHEET_PYTHON = Path('C:\\Users\\Administrator\\.dsh\\dsh-runtimes\\dsh-primary-runtime\\dependencies\\python\\python.exe')
 # Extra places an openpyxl-capable interpreter plausibly lives; the hardcoded
 # Codex runtime above only exists on machines that installed that bundle.
 EXTRA_SPREADSHEET_PYTHONS = (
-    Path("/tmp/aivenv/bin/python"),
-    Path.home() / ".local/bin/python3.12",
-    Path.home() / ".local/bin/python3.13",
+    Path.home() / ".dsh" / "dsh-runtimes" / "dsh-primary-runtime" / "dependencies" / "python" / "python.exe",
 )
 
 
@@ -200,6 +196,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--fetch-file", type=Path,
         help="包含最新第一步 fetch 的文本文件；省略则自动复用本机浏览器的天猫登录态",
+    )
+    p.add_argument("--browser", default="auto", choices=["auto", "chrome", "chrome-beta", "chrome-canary", "edge", "brave", "chromium"])
+    p.add_argument(
+        "--transport", default="auto", choices=["auto", "cookie", "bridge"],
+        help="登录态来源：auto=cookie 库优先、失败自动回退浏览器桥（默认）；"
+             "cookie=只读浏览器 cookie 库；bridge=借已登录标签页里的 fetch",
+    )
+    p.add_argument(
+        "--bridge-url", default="",
+        help="浏览器桥地址，默认 http://127.0.0.1:8899（脚本会自动起桥）",
     )
     p.add_argument(
         "--write-off-start",
@@ -336,30 +342,39 @@ def validate_fetch_source(url: str, request: dict[str, Any]) -> None:
         raise ValueError("第一步 queryBillDetail fetch 必须是 POST 请求")
 
 
-def load_browser_headers() -> dict[str, str]:
-    """复用本机浏览器已登录的天猫会话，省去手工复制 fetch。"""
+def load_browser_headers(
+    transport: str = "auto", bridge_url: str | None = None, browser: str = "auto",
+) -> tuple[dict[str, str], Any]:
+    """复用本机浏览器已登录的天猫会话，省去手工复制 fetch。
+
+    传输层由 tmall_session.build_session 决定：cookie 库优先，读不出来（Windows
+    v20 App Bound Encryption / Edge 独占 Cookies 文件）时自动回退到「页面内 fetch 桥」。
+    """
     scripts_dir = str(Path(__file__).resolve().parent)
     if scripts_dir not in sys.path:
         sys.path.insert(0, scripts_dir)
     import tmall_session
 
     try:
-        headers = tmall_session.build_headers()
+        built = tmall_session.build_session(transport, browser, tmall_session.DEFAULT_DOMAIN, bridge_url)
     except tmall_session.SessionError as exc:
         raise ValueError(
-            "本机浏览器里没有可用的天猫登录 cookie。先运行 "
-            "`python3 scripts/ensure_login.py` 确认状态，再用 magpie-browser 在当前已打开的"
-            "浏览器里打开 https://tgcwork.tmall.com/login 完成登录（复用已有标签，不要新开浏览器），"
+            "拿不到天猫登录态（cookie 库与浏览器桥都不可用）。先运行 "
+            "`python3 scripts/ensure_login.py` 确认状态；桥路线需要先 "
+            "`python scripts/browser_bridge.py --port 8899` 并用 magpie-browser 的 evaluate "
+            "在已登录的 tgc.tmall.com 标签里执行 scripts/bridge_agent.js；"
+            "如果浏览器本身没登录，用 magpie-browser 在当前已打开的浏览器里打开 "
+            "https://tgcwork.tmall.com/login 完成登录（复用已有标签，不要新开浏览器），"
             "然后重跑本命令。" + (f"（诊断：{str(exc).splitlines()[0]}）" if str(exc) else "")
         ) from exc
-    if not tmall_session.check_session(headers):
+    headers, session = built["headers"], built["session"]
+    if not tmall_session.check_session(headers, session):
         raise ValueError(
-            "本机浏览器登录态已失效（cookie 在但天猫不认）。先运行 "
-            "`python3 scripts/ensure_login.py` 确认状态，再用 magpie-browser 在当前已打开的"
-            "浏览器里打开 https://tgcwork.tmall.com/login 重新登录（复用已有标签，不要新开浏览器），"
-            "然后重跑本命令。"
+            "天猫登录态已失效。先运行 `python3 scripts/ensure_login.py` 确认状态，再用 "
+            "magpie-browser 在当前已打开的浏览器里打开 https://tgcwork.tmall.com/login "
+            "重新登录（复用已有标签，不要新开浏览器），然后重跑本命令。"
         )
-    return headers
+    return headers, session
 
 
 def validate_runtime_options(args: argparse.Namespace) -> None:
@@ -667,11 +682,14 @@ def archive_base_name(path: Path) -> str:
     return path.stem or "archive"
 
 
-def download_and_extract(url: str, output_dir: Path, task_id: str) -> tuple[list[Path], list[Path]]:
+def download_and_extract(
+    url: str, output_dir: Path, task_id: str, session: Any = None,
+) -> tuple[list[Path], list[Path]]:
     output_dir.mkdir(parents=True, exist_ok=True)
     request = Request(url, headers={"user-agent": "Mozilla/5.0"})
+    opener = session if session is not None else build_opener()
     try:
-        response = build_opener().open(request, timeout=300)
+        response = opener.open(request, timeout=300)
     except HTTPError as exc:
         raise RuntimeError(f"下载文件失败：HTTP {exc.code}") from exc
     with response:
@@ -1160,7 +1178,7 @@ def execute_export_module(
     if not file_url:
         raise RuntimeError("任务已 FINISHED，但第一条记录中没有 fileUrl")
     target_dir = module_output_dir(args.output_dir.expanduser().resolve(), module_key, date_filters, multi)
-    saved, extracted = download_and_extract(file_url, target_dir, task_id)
+    saved, extracted = download_and_extract(file_url, target_dir, task_id, session)
     print("最终状态：FINISHED")
     print("原始文件：")
     for path in saved:
@@ -1356,7 +1374,7 @@ def execute_module(
     if not urls:
         raise RuntimeError("任务成功但没有找到下载地址")
     target_dir = module_output_dir(args.output_dir.expanduser().resolve(), module_key, date_filters, multi)
-    saved, extracted = download_and_extract(urls[0], target_dir, task_id)
+    saved, extracted = download_and_extract(urls[0], target_dir, task_id, session)
     print("最终状态：SUCCEED")
     print("原始文件：")
     for path in saved:
@@ -1537,10 +1555,13 @@ def main() -> int:
 
     # Validate every module's date payload before making the first network request.
     dates_by_module = {key: module_date_filters(args, body, MODULES[key]) for key in module_keys}
-    base_headers = headers_from(query_request) if query_request else load_browser_headers()
-    if not base_headers.get("cookie"):
-        raise ValueError("最新 fetch 中没有 Cookie，无法复用登录状态")
-    session = build_opener()
+    if query_request:
+        base_headers = headers_from(query_request)
+        if not base_headers.get("cookie"):
+            raise ValueError("最新 fetch 中没有 Cookie，无法复用登录状态")
+        session = build_opener()
+    else:
+        base_headers, session = load_browser_headers(args.transport, args.bridge_url or None, args.browser)
     multi = args.module == "all" or len(module_keys) > 1
     state_dates = {key: common_dates[key] for key in ("writeOffTime", "orderPayTime") if key in common_dates}
     state = {

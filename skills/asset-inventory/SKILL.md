@@ -5,12 +5,23 @@ description: 资产盘算工作流：默认直接复用本机浏览器已登录�
 
 # 资产盘算
 
+## 可靠执行约定（2026-11-03 更新）
+
+- 多店首次执行也必须绑定身份：先按指定账号登录，再用 `scripts/supplier_identity.py` 读 `companyName`/`supplierIdSec` 核对确实是对应店铺，把这两个值写进 `--shops-file` 清单（或 `--shop` 第7段）。手机号、scm 提示、公司名不是同一种标识，禁止把任意现有提示直接绑定给用户指定账号。未声明身份时 runner 拒绝下载；不得通过跳过登录检查绕过。
+- 首店未完成身份确认和纠错，不得执行后续店铺。导航/换号后在同一 tgc 标签重新注入桥，确认 agentAttached 后再运行 ensure_login。本机已知 cookie 不可读时使用 --transport bridge，其他机器保留 auto。
+- 每店 inventory-manifest.json 绑定账号、supplierIdSec/companyName、店名、支付/结算日期与模块范围，并保存来源文件 SHA256。旧目录无清单时拒绝自动认领；身份或日期变化请使用新的输出根目录。禁止凭目录存在就复用下载。
+- 同一清单续跑自动向下载器传 --resume；--reuse-downloads 必须验证完成模块、日期、来源文件和摘要。--skip-completed 还要验证最终交付文件摘要，不能仅信旧 ok 字段。
+- 父子进程统一 UTF-8；stdout/stderr 分文件保存。builder 用 --result-json 写 schemaVersion=1 的原子 JSON；解析失败、统计缺失、样式/写入验证未通过时必须失败，不得用空结果宣称成功。
+- 正式交付前执行 scripts/validate_asset_workbook.py，只读核对来源整行去重、固定表头、公式和展示结构，报告独立保存。允许 XLSX 15位有效数字序列化、正确 IF 包装、数组公式与合并样式的等价表示；不放宽实际账务差异。
+- scripts/asset_report.py 从下载状态、builder-result.json 和独立校验结果生成执行报告。流程查询数未提供用未知，零记录写0；文件数按实际有数据流程动态列出，不固定15个。
+- 默认不重算、不修改已交付账簿。优化脚本以本地模拟回归测试验证，不为测试创建线上下载任务。
+
 ## 默认行为
 
 用户给出店铺名称、结算时间和支付时间后直接执行，**不需要用户复制 fetch**：
 
 0. **店铺名称**取用户本条消息里发送的名称原文（例如「埔鸣--迎风部」或「埔鸣」），不做增删改；它同时用于公司汇总「店铺」列和盘算文件名前缀。用户没给名称时先问一句店铺名，不要自行编造。用户一次给了多个店铺时，按用户列出的先后顺序逐店执行，见“多店铺串行执行”。
-1. 登录态由脚本自动从本机浏览器读取（`scripts/tmall_session.py`：解密 Chrome cookie 库，取出含 HttpOnly 的完整 cookie），并用 `https://scm.tmall.com/loginStatus` 校验有效后才会发请求。
+1. 登录态由脚本自动获取（`scripts/tmall_session.py` 的 `build_session`，`--transport auto`）：先读本机浏览器 cookie 库；读不出来（Windows 上 Chrome/Edge 的 `v20` App-Bound Encryption、Edge 运行中独占 `Cookies` 文件）就自动切到**浏览器桥** —— 借已登录标签页里的 `fetch(credentials:"include")` 发请求，HttpOnly cookie 由浏览器自己带上，从不落到本进程。两条路线都会用 `https://scm.tmall.com/loginStatus` 校验有效后才会发请求。
 2. 校验不通过时**不要停下去找用户**：按下一节「登录态自愈」用 magpie-browser 在当前已打开的浏览器里自动完成登录，登录成功后再继续原流程。
 3. 用户未明确限定流程时，按下表固定顺序执行全部17个流程。
 4. 每个流程使用技能配置的固定 `billType`（导出流程为 `bizType`+`bizScene`）和日期字段，依次查询、创建明细任务、轮询、获取签名地址、下载和安全解压。
@@ -18,7 +29,7 @@ description: 资产盘算工作流：默认直接复用本机浏览器已登录�
 6. 在同一盘算文件上累积各流程结果；保存后验证目标 Sheet、写入行数、固定表头及 `#REF!`。
 7. 仅更新现有工作簿中与本次数据相关的值和公式；不会创建、删除或重建任何 Sheet，也不会自动打开工作簿。公式缓存默认不通过 LibreOffice 重写；只有用户明确要求时才可进行无界面重算。
 
-若用户主动贴了一条 `queryBillDetail` fetch，则改用它提供的登录态和日期（fetch body 里的日期优先于缺省值），但仍可用命令行日期覆盖。fetch body 原有 `billType` 不限制执行范围。
+若用户主动贴了一条 `queryBillDetail` fetch，则可改用它提供的登录态；完整 Cookie 只能来自 DevTools 的 Network 请求（复制完整 fetch），不能用 `document.cookie` 代替，因为其中不含 HttpOnly Cookie。fetch body 里的日期可作为输入，但命令行日期覆盖它；fetch body 原有 `billType` 不限制执行范围。
 
 不要只解释参数，也不要再次询问是否执行。只有用户明确说“只跑某流程”时才传单一 `--module`。
 
@@ -26,28 +37,41 @@ description: 资产盘算工作流：默认直接复用本机浏览器已登录�
 
 **判据永远来自脚本，不要靠肉眼或 cookie 猜测**：先跑
 
-```bash
-python3 /Users/rabbit/.agents/skills/asset-inventory/scripts/ensure_login.py
+```powershell
+& "C:\Users\Administrator\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe" C:\Users\Administrator\.dsh\skills\asset-inventory/scripts/ensure_login.py
 ```
 
 它只输出一个 JSON 对象并以退出码区分状态：`0`=登录态有效（直接继续原流程，**不要再打开登录页**）；`3`=需要登录（`reason` 为 `no-cookie` / `expired` / `wrong-account`）；`1`=脚本自身出错。**只有退出码为 3 时才执行下面的登录动作**，并且优先照抄 JSON 里的 `action` 文案（它已经写明该复用什么标签）。
 
+`no-cookie` 在 Windows 上通常是「cookie 库读不出来」或「桥未连接」，不证明浏览器未登录；先补桥并确认页面代理已连接，再判断是否真没登录。页面导航、刷新或换号后必须重新注入 agent：
+
+1. **起桥并注入页面代理**（`scripts/browser_bridge.py`，默认 `127.0.0.1:8899`）。脚本自己也会按需起桥，但页面代理必须由 agent 注入，否则桥只能收到空队列：
+   ```powershell
+   & "C:\Users\Administrator\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe" C:\Users\Administrator\.dsh\skills\asset-inventory/scripts/browser_bridge.py --port 8899
+   ```
+   用 `browser` 工具在**已登录 `tgc.tmall.com` 的标签**上执行 `evaluate`，脚本内容取自
+   ```powershell
+   "...\python.exe" C:\Users\Administrator\.dsh\skills\asset-inventory/scripts/browser_bridge.py --print-agent
+   ```
+   返回 `"bridge agent started"` 即注入成功；`ping` 里 `agentAttached: true` 才算接上。代理是幂等的，重复注入不会开两个循环。
+2. 桥接上后再跑一次 `ensure_login.py`：仍是 `no-cookie` 也不单独证明浏览器未登录；先确认 agent 已在 `tgc.tmall.com` 标签重新注入且 `agentAttached: true`，再按脚本登录态结果处理。
+
 多店换号时加 `--expect-account <账号提示>`：即使当前有有效登录态，只要不是这家店的账号也会返回 `reason: wrong-account`，避免把上一家店的会话误当成这家店。
 
-0. **先确认有浏览器可接管**：调 `browser` 工具 `action: "browsers"`。
-   - 返回已有会话（如 `b5 Chrome 156`）→ 直接用它，**不要碰其他浏览器**。
-   - 返回为空（Chrome 没启动）→ 先尝试 `open -a "Google Chrome"` 启动用户本机那个 Chrome（同一个 profile，不是新装/新 profile 的实例），然后每 2 秒调一次 `browsers`，最多等 20 秒等 Magpie 扩展连上。
-   - 20 秒后仍为空（扩展没装/没启用）→ 只提示用户检查 Magpie Browser 扩展，不要自己另起浏览器或另建 profile。
-1. **复用当前浏览器，绝不新开浏览器**：只用 magpie-browser MCP 的 `browser` 工具。先 `tabs` 找有没有 `tgcwork.tmall.com` 标签，**有就 `tab_select` 复用它**；没有再 `tab_new`（带 url）一个标签页 —— `tab_new` 就是在“当前这个已打开的浏览器里新开窗口”，符合要求。不要用 chrome-devtools，不要 `open -a`（除非第 0 步的“浏览器没开”场景，且只开用户原本那个 Chrome），不要启动第二个浏览器实例。
+0. **先确认有 Edge 可接管**：调 `browser` 工具 `action: "browsers"`。
+   - 返回已有 Edge 会话（如 `b5 Edge 156`）→ 直接用它，**不要切换到其他浏览器**。
+   - 返回为空（Edge 没启动）→ 只提示用户启动本机 Edge 并确认 Magpie Browser 扩展已连接；不要自动启动 Chrome、不要另起浏览器或新建 profile。
+   - 仍无会话时只提示用户检查 Magpie Browser 扩展，不要自行创建浏览器实例。
+1. **复用当前 Edge，绝不新开浏览器实例**：只用 magpie-browser MCP 的 `browser` 工具。先 `tabs` 找有没有 `tgc.tmall.com` 标签，**有就 `tab_select` 复用它**；没有再 `tab_new`（在当前已连接的 Edge 中新开标签）。桥必须注入到 `tgc.tmall.com` 标签，因为 API 与该页面同源；页面导航、刷新或切换账号后都要在当前标签重新注入 agent，并确认 `ping` 的 `agentAttached: true`。不要用 chrome-devtools，不要启动第二个浏览器实例。
 2. **判断登录框状态**：`snapshot`（interactive）读登录页，普通登录 tab 的 iframe 里有「请输入账号名/手机号/邮箱」「请输入登录密码」「登录」三个元素。
    - 两个输入框都已有值（用户或密码管理器预填）→ 直接进入第 4 步，**不要改动内容**。
    - 输入框为空 → 进入第 3 步。
-3. **凭据来源只有两个，都不落盘**：用户在本轮对话里已给出账号/密码就用它；否则用 `ask_user_question` 问一次（账号 + 密码），说明只用于本次填表。**绝不把密码写进技能文件、状态文件、日志或回复**；**绝不尝试从 macOS 钥匙串、Chrome `Login Data`、`security` 或其他脚本里挖密码**。
+3. **凭据来源只有两个，都不落盘**：用户在本轮对话里已给出账号/密码就用它；否则用 `ask_user_question` 问一次（账号 + 密码），说明只用于本次填表。**绝不把密码写进技能文件、状态文件、日志或回复**；**绝不尝试从 macOS 钥匙串、Windows DPAPI 凭据库、Chrome `Login Data`、`security` 或其他脚本里挖密码**。
 4. 用 `type`/`fill` 按 ref 填表，再用 `click` 点「登录」按钮（真实点击，不要用 `evaluate` 合成点击）。
 5. **登录要验证，不能假定成功**：刚点完登录时 cookie 可能还没落库，用
 
-   ```bash
-   python3 /Users/rabbit/.agents/skills/asset-inventory/scripts/ensure_login.py --wait 30
+   ```powershell
+   & "C:\Users\Administrator\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe" C:\Users\Administrator\.dsh\skills\asset-inventory/scripts/ensure_login.py --wait 30
    ```
 
    轮询到 `loggedIn: true`（或退出码 0）才算成功。仍为 3 时：`snapshot` 看页面是否有短信/滑块/二次验证，有就停下来让用户在浏览器里自己过（不绕过验证码）；无提示则检查账号密码是否输错，最多重试 2 次。
@@ -66,7 +90,7 @@ python3 /Users/rabbit/.agents/skills/asset-inventory/scripts/ensure_login.py
 
 - `公司汇总!A1:AD1` 是固定30列表头：禁止改名、重排、插列、删列或覆盖表头。
 - `公司汇总` 的 `店铺` 列（A列）由 `--shop-name` 统一填入用户发送的店铺名称；不改表头、不改变模板55行结构与样式。
-- 公司汇总在全部商品行（含模板预留的空白公式行）之后**固定追加一行「总计」**（`店铺` 列写「总计」，`商品ID` 留空），见下方「公司汇总总计行」；除该行外不加其他合计行。
+- 公司汇总在最后一条商品行之后**紧贴追加一行「总计」**；模板预留空白公式行放在总计之后（`店铺` 列写「总计」，`商品ID` 留空），见下方「公司汇总总计行」；除该行外不加其他合计行。
 - `所有商品效果数据导出` 仅由专属流程 `all-item-effects-export` 导入；其余16个流程不得清空、替换或写入该 Sheet。
 - 商品贷款下载文件写入模板的 `商品货款` Sheet。
 - 每次只替换当前流程目标 Sheet 的表头以下数据；同一日期输出已存在时，以该文件为模板继续累积其他流程。
@@ -128,7 +152,8 @@ python3 /Users/rabbit/.agents/skills/asset-inventory/scripts/ensure_login.py
 
 ## 输入、安全与失败处理
 
-- 登录态优先级：显式 `--fetch-file` > 本机浏览器 cookie 库。fetch 若使用，必须来自 `https://tgc.tmall.com/ds/api/v1/fbi/bill/queryBillDetail` 且方法为 POST。
+- 登录态优先级：显式 `--fetch-file` > `--transport auto`（本机浏览器 cookie 库 → 浏览器桥）。fetch 若使用，必须来自 `https://tgc.tmall.com/ds/api/v1/fbi/bill/queryBillDetail` 且方法为 POST。
+- 登录态来源可用 `--transport` 强制：`auto`（默认，cookie 库优先、失败回退桥）、`cookie`（只读 cookie 库，用于排查）、`bridge`（只用页面桥）。桥地址用 `--bridge-url` 覆盖默认的 `http://127.0.0.1:8899`。
 - 日期格式必须为 `YYYY-MM-DD`，开始不晚于结束；命令行日期优先于 fetch body。
 
 - 日期只认用户给的值，不做任何推算：用户在请求里给了结算日期和支付日期，就分别用它们；只给了支付日期（单一账期），就把它同时用于“结算+支付”流程的 `orderPayTime` 和4个“仅结算”流程的 `writeOffTime`。
@@ -147,63 +172,84 @@ python3 /Users/rabbit/.agents/skills/asset-inventory/scripts/ensure_login.py
 - 续跑必须使用同一结算/支付日期和同一盘算输出；日期不一致时拒绝混合账期。
 - `--module <单流程>` 仅用于用户明确要求单流程；`--module all` 与省略 `--module` 等价。
 
+## 本机运行环境（Windows）
+
+- Python 解释器（固定路径，已带 openpyxl；`cryptography` 由技能自带）：`C:\Users\Administrator\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe`
+- 技能目录：`C:\Users\Administrator\.dsh\skills\asset-inventory`
+- 下文命令按本机 PowerShell 写法给出；出现 `python3` 的地方一律换成上面这个解释器路径。
+- `cryptography`、`cffi` 已装在 `C:\Users\Administrator\.dsh\skills\.vendor`，`tmall_session.py` 启动时自动加载，无需再 `pip install`。
+- **本机实测（2026-11-03）：直接读浏览器 cookie 库这条路走不通。** 这台机器的 Chrome 与 Edge 156 把 cookie 存成 `v20`（App-Bound Encryption），解密密钥由浏览器进程 + 系统服务共同保护，普通进程拿不到；Edge 运行时还会独占 `Cookies` 文件（`[WinError 32]` / `JET_errFileAccessDenied`）。脚本会明确报错而不是给出错误数据。
+- **因此本机默认走浏览器桥（无需用户发 fetch）**：`scripts/browser_bridge.py` 在 `127.0.0.1:8899` 起一个本地 HTTP 服务，`scripts/bridge_agent.js` 注入到已登录的天猫标签里，脚本把每个天猫域请求投给页面执行 `fetch(credentials:"include")`，HttpOnly cookie 由浏览器自己附上；返回的状态码/头/正文（二进制转 base64）回传给 Python。签名下载地址（OSS/CDN）不走页面，由 Python 直接 urllib 下载，避免跨域与 base64 膨胀。
+- 脚本会在每次轮询前和请求后刷新桥接 session，不使用定时器。独立启动桥时需让 `browser_bridge.py` 后台常驻；若 `--bridge-url` 使用自定义端口，注入前先在页面设置 `window.__dshBridgeBase` 为该桥地址。
+- `--fetch-file` 仍然支持，作为显式兜底（优先级最高）：在已登录 `tgc.tmall.com` 标签的 DevTools Network 中复制完整 POST `fetch`（不要用 `document.cookie`，它不含 HttpOnly Cookie）存成 txt。日期默认以命令行为准；CLI 日期会覆盖 fetch body 中的日期。
+- 若换成未启用 App-Bound Encryption 的浏览器配置（或 macOS），`auto` 会自动走回读 cookie 的模式，无需改代码。
+
 ## 执行命令
 
-解释器要求：Python 3.11+（已移除 PEP 701 多行 f-string，3.11 与 3.12 均已实测可解析运行）且已安装 `cryptography`、`openpyxl`。若当前 `python3` 缺依赖，可先 `uv venv /tmp/aivenv --python 3.12 && uv pip install --python /tmp/aivenv/bin/python cryptography openpyxl`，再把下文的 `python3` 换成 `/tmp/aivenv/bin/python`。
+解释器要求：Python 3.11+（已移除 PEP 701 多行 f-string，3.11 与 3.12 均已实测可解析运行），使用已知可用的 `C:\Users\Administrator\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe`，其已带 `cryptography`、`openpyxl`；不要使用失效的 Linux `/tmp` 或 `uv` 安装示例。
 
 默认执行全部17个流程（自动复用本机浏览器登录态，只需店铺名和日期）：
 
-```bash
-python3 /Users/rabbit/.agents/skills/asset-inventory/scripts/tmall_bill_download.py \
-  --shop-name "埔鸣--迎风部" \
-  --write-off-start 2026-07-01 --write-off-end 2026-07-31 \
-  --order-pay-start 2026-07-01 --order-pay-end 2026-07-31 \
+```powershell
+& "C:\Users\Administrator\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe" C:\Users\Administrator\.dsh\skills\asset-inventory/scripts/tmall_bill_download.py `
+  --shop-name "埔鸣--迎风部" `
+  --write-off-start 2026-07-01 --write-off-end 2026-07-31 `
+  --order-pay-start 2026-07-01 --order-pay-end 2026-07-31 `
   --output-dir /path/to/outputs
 ```
 
 明确单跑一个流程。4个“仅结算”流程只给支付日期（它们的结算区间就取这里给的值）：
 
-```bash
-python3 /Users/rabbit/.agents/skills/asset-inventory/scripts/tmall_bill_download.py \
-  --module customer-service-fee --shop-name "埔鸣" \
-  --order-pay-start 2026-07-01 --order-pay-end 2026-07-31 \
+```powershell
+& "C:\Users\Administrator\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe" C:\Users\Administrator\.dsh\skills\asset-inventory/scripts/tmall_bill_download.py `
+  --module customer-service-fee --shop-name "埔鸣" `
+  --order-pay-start 2026-07-01 --order-pay-end 2026-07-31 `
   --output-dir /path/to/outputs
 ```
 
 “结算+支付”流程单跑时仍按用户给的结算、支付两段日期传：
 
-```bash
-python3 /Users/rabbit/.agents/skills/asset-inventory/scripts/tmall_bill_download.py \
-  --module consumer-experience-service --shop-name "埔鸣" \
-  --write-off-start 2026-07-01 --write-off-end 2026-07-31 \
-  --order-pay-start 2026-07-01 --order-pay-end 2026-07-31 \
+```powershell
+& "C:\Users\Administrator\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe" C:\Users\Administrator\.dsh\skills\asset-inventory/scripts/tmall_bill_download.py `
+  --module consumer-experience-service --shop-name "埔鸣" `
+  --write-off-start 2026-07-01 --write-off-end 2026-07-31 `
+  --order-pay-start 2026-07-01 --order-pay-end 2026-07-31 `
   --output-dir /path/to/outputs
 ```
 
 想先确认登录态是否可用（唯一可信判据，退出码 0=有效 / 3=需登录 / 1=脚本出错）：
 
-```bash
-python3 /Users/rabbit/.agents/skills/asset-inventory/scripts/ensure_login.py
+```powershell
+& "C:\Users\Administrator\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe" C:\Users\Administrator\.dsh\skills\asset-inventory/scripts/ensure_login.py
 ```
 
-只想要原始诊断时用 `scripts/tmall_session.py --json`（输出为纯 JSON，日志已移到 stderr）。
+只想要原始诊断时用 `scripts/tmall_session.py --json`（输出为纯 JSON，日志已移到 stderr，其中 `transport` 字段告诉你当前走的是 `cookie` 还是 `bridge`）。
+
+只想走某一条传输层时（排查用）：
+
+```powershell
+# 只用页面桥
+.../ensure_login.py --transport bridge
+# 只读 cookie 库，看看到底是不是加密/独占挡住
+.../ensure_login.py --transport cookie
+```
 
 仍支持用户贴 fetch 的老用法，`--fetch-file` 与命令行日期可混用：
 
-```bash
+```powershell
 .../tmall_bill_download.py --fetch-file /path/to/latest-fetch.txt --output-dir /path/to/outputs
 ```
 
 中断后续跑，或跳过升级前已完成的商品货款：
 
-```bash
+```powershell
 # 有状态文件
-.../tmall_bill_download.py --write-off-start 2026-07-01 --write-off-end 2026-07-31 \
+.../tmall_bill_download.py --write-off-start 2026-07-01 --write-off-end 2026-07-31 `
   --order-pay-start 2026-07-01 --order-pay-end 2026-07-31 --output-dir /path/to/outputs --resume
 
 # 无状态文件但已确认商品货款完成
-.../tmall_bill_download.py --write-off-start 2026-07-01 --write-off-end 2026-07-31 \
-  --order-pay-start 2026-07-01 --order-pay-end 2026-07-31 --output-dir /path/to/outputs \
+.../tmall_bill_download.py --write-off-start 2026-07-01 --write-off-end 2026-07-31 `
+  --order-pay-start 2026-07-01 --order-pay-end 2026-07-31 --output-dir /path/to/outputs `
   --skip-module product-loan
 ```
 
@@ -215,27 +261,27 @@ python3 /Users/rabbit/.agents/skills/asset-inventory/scripts/ensure_login.py
 
 数据量大时推荐两阶段执行：先只下载全部17个流程，全部成功后一次性导入模板，避免中途失败留下半成品盘算。
 
-```bash
+```powershell
 # 第一阶段：只下载并安全解压（不写盘算）
-.../tmall_bill_download.py --write-off-start 2026-07-01 --write-off-end 2026-07-31 \
-  --order-pay-start 2026-07-01 --order-pay-end 2026-07-31 \
+.../tmall_bill_download.py --write-off-start 2026-07-01 --write-off-end 2026-07-31 `
+  --order-pay-start 2026-07-01 --order-pay-end 2026-07-31 `
   --output-dir /path/to/outputs --no-pan-suan
 
 # 第二阶段：全部下载成功后一次性导入模板
-.../pan_suan_builder.py --template /Users/rabbit/.agents/skills/asset-inventory/assets/盘算模板.xlsx \
-  --output /path/to/outputs/<店铺>_<结算开始>_<结算结束>.xlsx \
-  --shop-name "<店铺>" \
+.../pan_suan_builder.py --template C:\Users\Administrator\.dsh\skills\asset-inventory/assets/盘算模板.xlsx `
+  --output /path/to/outputs/<店铺>_<结算开始>_<结算结束>.xlsx `
+  --shop-name "<店铺>" `
   --strict --json --no-recalculate --input /path/to/outputs
 ```
 
 - `--input` 传整个输出目录时自动识别每个下载文件对应的目标 Sheet；`所有商品效果数据导出` 的 hosting 导出 xlsx 缺少工作表 dimension，构建脚本会自动回退全量读取。
 - 0 条数据的流程没有下载文件，其目标 Sheet 保持模板原样。
-- 完成后把每个有数据流程的明细 xlsx（以目标 Sheet 名称命名）和最终盘算文件复制到 `<output-dir>/<店铺>_<结算开始>_<结算结束>_输出/`，与原始下载目录分开交付。
-- 合并导入已优化：明细读取用只读流式、回填边框直接写样式ID（避免 openpyxl 逐格样式查重）、保存后校验用只读流式计数并扫描 `#REF!`，不再逐格二次扫描，百万级明细行可在秒级完成。
+- 完成后把每个有数据流程的明细 xlsx（以目标 Sheet 名称命名）复制到 `<output-dir>/<店铺>_<结算开始>_<结算结束>_输出/`，与原始下载目录分开交付。多店（runner）批次把各店盘算工作簿统一汇入 `<output-dir>/资产盘算_<结算开始>_<结算结束>/`；单店直接运行时盘算文件与下载目录同级。
+- 合并导入已优化：明细读取用只读流式、回填边框直接写样式ID（避免 openpyxl 逐格样式查重）、保存后校验用只读流式计数并扫描 `#REF!`，不再逐格二次扫描，实际耗时取决于明细量、样式和磁盘速度，以阶段计时为准。
 
 ## 多店铺串行执行
 
-用户一次给出多个店铺（每个店铺是独立的天猫账号）时，用 `scripts/multi_shop_runner.py` 串行执行：**一个店铺完整跑完（下载 → 导入模板 → 交付 → 状态落盘）才进入下一个店铺**，不复用上一家店的登录态，也不并发。
+用户一次给出多个店铺（每个店铺是独立的天猫账号）时，用 `scripts/multi_shop_runner.py` 串行执行：**一个店铺完整跑完（下载 → 导入模板 → 交付 → 状态落盘）才进入下一个店铺**，不复用上一家店的登录态，也不并发。所有店铺的盘算工作簿（公司最终结果）最后都汇进同一个 `资产盘算_<结算开始>_<结算结束>/` 文件夹。
 
 ### 执行顺序与输入
 
@@ -243,43 +289,50 @@ python3 /Users/rabbit/.agents/skills/asset-inventory/scripts/ensure_login.py
 - 店铺名取用户原文，各自用于该店的 `公司汇总!A` 列与盘算文件名前缀。
 - runner 本身只接收店铺名、账号和日期，**它自己不接收也不保存密码**：登录要么复用浏览器现有会话，要么由 agent 按「登录态自愈」在浏览器里填表完成（密码只在本轮内存/表单里，不写入任何文件、状态或日志）。
 - 两种给店方式（可混用，`--shop` 追加在清单之后）：
-  - 命令行：`--shop "店名,账号,支付开始,支付结束[,结算开始,结算结束[,账号提示]]"`，可重复；第5/6段省略时结算区间回落到支付区间。
-  - JSON 清单（`--shops-file`）：`{"shops":[{"shop":"店名","account":"账号","orderPayStart":"YYYY-MM-DD","orderPayEnd":"YYYY-MM-DD","writeOffStart":"YYYY-MM-DD","writeOffEnd":"YYYY-MM-DD","accountHint":"可选"}]}`，也接受裸数组。
+  - 命令行：`--shop "店名,账号,支付开始,支付结束[,结算开始,结算结束[,supplierIdSec或账号提示[,公司名]]]"`，可重复；第5/6段省略时结算区间回落到支付区间；第7段是纯数字按 `supplierIdSec` 解释，否则按老的 cookie 账号提示解释。
+  - JSON 清单（`--shops-file`）：`{"shops":[{"shop":"店名","account":"账号","orderPayStart":"YYYY-MM-DD","orderPayEnd":"YYYY-MM-DD","writeOffStart":"YYYY-MM-DD","writeOffEnd":"YYYY-MM-DD","supplierIdSec":1000000300460723,"companyName":"东阳市游购日用品有限公司"}]}`，也接受裸数组。`supplierIdSec` / `companyName` 至少给一个（登录后跑一次 `scripts/supplier_identity.py` 即可拿到两者），用来核对“当前登录的到底是哪家店”；老清单里的 `accountHint`（cookie 提示）仍兼容，但**只在没有 supplierIdSec/companyName 时才生效**。
 
 ### 逐店登录闸门（关键）
 
-每进入一个店铺前后，runner 先用 `scripts/ensure_login.py` 的逻辑读本机浏览器登录态并取账号提示（cookie 里的 `tracknick`/`lgc`/`cookie17`/`unb`，空值跳过），然后：
+每进入一个店铺前后，runner 先用 `scripts/ensure_login.py` 的逻辑读本机浏览器登录态（`--browser auto` + `--transport auto`：cookie 库优先、失败回退浏览器桥），再问平台“我是谁”（`scripts/supplier_identity.py` → `https://tgc.tmall.com/api/v1/supplierHome/accountInfo` 拿 `companyName`/`supplierIdSec`），然后：
 
-1. 未登录（`reason` 为 `no-cookie`/`expired`）→ runner 输出 `{"status":"需要登录","shop":...,"account":...,"action":...}` 并以退出码 3 结束。此时**不要直接把球踢回给用户**：按「登录态自愈」用 magpie-browser 在当前已打开的浏览器里登录该店账号（复用已有 `tgcwork.tmall.com` 标签，没有才 `tab_new`），然后用 `ensure_login.py --wait 30` 确认 `loggedIn: true`，再重跑同一条 runner 命令从该店继续。
-2. 该店配置了 `accountHint` 但当前提示不一致 → 输出 `{"status":"登录态与店铺不匹配",...}` 并停下（说明浏览器里还是别的账号），走「登录态自愈」换成这家店的账号。
-3. 与上一个已跑店铺的提示相同 → 输出 `{"status":"登录态没有切换",...}` 并停下（说明用户没换账号），同上处理。
+1. 未登录（`reason` 为 `no-cookie`/`expired`）→ runner 输出 `{"status":"需要登录","shop":...,"account":...,"action":...}` 并以退出码 3 结束。此时**不要直接把球踢回给用户**：按「登录态自愈」用 magpie-browser 在当前已打开的浏览器里登录该店账号（复用已有 `tgc.tmall.com` 标签，没有才 `tab_new`），然后用 `ensure_login.py --wait 30` 确认 `loggedIn: true`，再重跑同一条 runner 命令从该店继续。
+2. 店清单声明了 `supplierIdSec` 或 `companyName`，但读不到 accountInfo → 输出 `{"status":"无法确认当前登录店铺",...}` 并停下（多半是桥掉线或会话过期）：重新注入 `scripts/bridge_agent.js`，确认 `supplier_identity.py` 能返回公司名后重跑。
+3. 声明的身份与实际登录身份不一致 → 输出 `{"status":"登录态与店铺不匹配",...}` 并停下（说明浏览器里还是别的账号），走「登录态自愈」换成这家店的账号。
+4. 没声明身份时才退回老规则：配置的 `accountHint` 与 cookie 提示不一致 → 同上停止。
+5. 与上一个已跑店铺的身份完全相同 → 输出 `{"status":"登录态没有切换",...}` 并停下（说明用户没换账号），同上处理。
+
+**为什么不再用 cookie 提示当身份**：实测天猫换号后 `tracknick`/`lgc`/`lid`/`dnk` 仍是上一个账号的值（只有 `_nk_` 变了，刷新也不更新），据此判断会误报“登录态与店铺不匹配”。`accountInfo` 返回的 `companyName`/`supplierIdSec` 与页面商家名一致，才是可信身份；核对通过后 runner 会把实际身份写进该店的 `verifiedIdentity` 留痕。
 
 自动登录完成后重跑同一条命令即可从该店继续（已完成的店铺不会重跑，见 `--skip-completed`）。只有登录页出现短信/滑块等需要人过的验证码，或用户明确说“不要自动登录”时，才停下让用户自己在浏览器里点。
 
 ### 每店产物与批次状态
 
 - 输出根目录下每店一个子目录 `<output-root>/<店铺>/`，内含各流程下载目录、`logs/1-download.log`、`logs/2-pan-suan.log`。
-- 盘算文件：`<output-root>/<店铺>/<店铺>_<结算开始>_<结算结束>.xlsx`（命名规则与单店一致）。
-- 交付文件夹：`<output-root>/<店铺>/<店铺>_<结算开始>_<结算结束>_输出/`，放 15 个按目标 Sheet 命名的明细 xlsx 加盘算文件副本。
-- 批次状态：`<output-root>/multi-shop-state.json`，记录每店日期、路径、三个阶段（`download`/`panSuan`/`deliver`）结果与 `ok`；**只记店铺名、账号、路径、日期和结果摘要，不写任何 cookie/token/密码**。
+- 盘算文件（工作副本）：`<output-root>/<店铺>/<店铺>_<结算开始>_<结算结束>.xlsx`（命名规则与单店一致）。
+- **公司最终结果文件夹**：`<output-root>/资产盘算_<结算开始>_<结算结束>/`，所有店铺的盘算工作簿都汇总到这里，文件名仍是 `<店铺>_<结算开始>_<结算结束>.xlsx`；同一账期多店共用一个文件夹，重跑同账期覆盖同名文件。交付给用户时这个文件夹就是「公司汇总最终结果」入口。
+- 交付文件夹（只放明细）：`<output-root>/<店铺>/<店铺>_<结算开始>_<结算结束>_输出/`，放实际有数据流程按目标 Sheet 命名的明细 xlsx；同流程多文件保留编号，禁止只复制第一份。**盘算工作簿不再复制到这里**，只在汇总文件夹留一份，避免同一文件两处副本。
+- 汇总副本写入后必须核对比对（`filecmp` 全字节）与工作副本一致，不一致即判失败。
+- 批次状态：`<output-root>/multi-shop-state.json`，记录每店日期、路径、三个阶段（`download`/`panSuan`/`deliver`）结果与 `ok`；**只记店铺名、账号提示、账号、路径、日期和结果摘要，不写任何 cookie/token/密码**。
 
 ### 命令
 
-```bash
-python3 /Users/rabbit/.agents/skills/asset-inventory/scripts/multi_shop_runner.py \
-  --shop "埔鸣--迎风部,13800000001,2026-09-01,2026-09-30,2026-09-01,2026-10-31" \
-  --shop "均沐桉,13800000002,2026-09-01,2026-09-30,2026-09-01,2026-10-31" \
+```powershell
+& "C:\Users\Administrator\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe" C:\Users\Administrator\.dsh\skills\asset-inventory/scripts/multi_shop_runner.py `
+  --shop "埔鸣--迎风部,13800000001,2026-09-01,2026-09-30,2026-09-01,2026-10-31" `
+  --shop "均沐桉,13800000002,2026-09-01,2026-09-30,2026-09-01,2026-10-31" `
   --output-root /path/to/outputs
 
 # 或从 JSON 清单读店铺（按数组顺序执行）
-python3 /Users/rabbit/.agents/skills/asset-inventory/scripts/multi_shop_runner.py \
+& "C:\Users\Administrator\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe" C:\Users\Administrator\.dsh\skills\asset-inventory/scripts/multi_shop_runner.py `
   --shops-file /path/to/shops.json --output-root /path/to/outputs
 
 # 先确认当前浏览器登录的是哪个账号（与 ensure_login.py 同源判定）
-python3 /Users/rabbit/.agents/skills/asset-inventory/scripts/multi_shop_runner.py --check-login
+& "C:\Users\Administrator\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe" C:\Users\Administrator\.dsh\skills\asset-inventory/scripts/multi_shop_runner.py --check-login
 ```
 
-- `--check-login`：只输出当前登录态 `{"loggedIn":true,"currentHint":"...","cookieCount":N}` 并以退出码 3/0 结束，用来判断“现在该不该换账号”。需要下一步动作建议时用 `scripts/ensure_login.py`（多返回 `reason`/`action`/`hasXsrf`，并可 `--wait` 等 cookie 落库）。
+- `--check-login`：只输出当前登录态 `{"loggedIn":true,"currentHint":"...","cookieCount":N,"transport":"bridge"}` 并以退出码 3/0 结束，用来判断“现在该不该换账号”。需要下一步动作建议时用 `scripts/ensure_login.py`（多返回 `reason`/`action`/`hasXsrf`，并可 `--wait` 等 cookie 落库）。
+- `--transport` / `--bridge-url` / `--browser`：与单店脚本同名同义，runner 会透传给下载阶段；默认 `auto` 即可，只有在排查时才显式指定。
 - `--skip-completed`：跳过批次状态里已 `ok` 的店铺，用于登录闸门中断后的续跑。
 - `--only 店名`（可重复）：只跑指定店铺，仍按清单顺序。
 - `--continue-on-error`：某店失败后继续下一店；**默认不继续**——某店失败立即停止后续店铺，已完成店铺的产物和批次状态全部保留。
@@ -326,15 +379,17 @@ body: {"pageNo":N,"pageSize":50,"startDateTime":<毫秒>,"endDateTime":<毫秒>,
 
 - 公司汇总固定30列表头已校验且未变，`店铺` 列已按用户发送的名称填写；
 - 公司汇总已在最后一条商品行下方紧贴追加「总计」行（商品ID 留空）；说明罚款按商品ID逐商品匹配、总计行对该列求和，客服服务费、赔付追缴、评价有礼、商业化账户充值提现取的是整表合计；
-- 盘算文件名与交付文件夹名均为 `店铺_日期` 形式；
+- 盘算文件名与各店交付文件夹名均为 `店铺_日期` 形式；公司最终结果统一放在 `资产盘算_<结算开始>_<结算结束>/` 文件夹（所有店铺的盘算工作簿都在这一个文件夹里）；
 - 所有商品效果数据导出仅由专属流程写入并已校验，其余流程未触碰；
 - 无商品归属的费用已单列，没有擅自分摊；
 - 如中断，列出已完成流程、失败流程和续跑方式。
-- 多店铺时按顺序逐店汇报：每店一行「✓/✗ 店铺名｜商品数 N｜盘算文件路径」，并给出批次状态文件路径；说明后续店铺是被哪一个登录闸门挡住的（需要登录 / 登录态与店铺不匹配 / 登录态没有切换）。
+- 多店铺时按顺序逐店汇报：每店一行「✓/✗ 店铺名｜商品数 N｜盘算文件路径」，盘算文件路径取汇总文件夹里的那一份，并给出汇总文件夹路径与批次状态文件路径；说明后续店铺是被哪一个登录闸门挡住的（需要登录 / 登录态与店铺不匹配 / 登录态没有切换）。
 
 ## 参考
 
 - [天猫账单模块与盘算映射](references/tmall-bill-module.md)
-- 登录态闸门（唯一入口，含 `reason`/`action`/`--wait`）：`scripts/ensure_login.py`
+- 登录态闸门（唯一入口，含 `reason`/`action`/`--wait`/`--transport`）：`scripts/ensure_login.py`
 - 多店铺串行执行：`scripts/multi_shop_runner.py`
-- 浏览器 cookie 解密与会话校验：`scripts/tmall_session.py`
+- 会话构建（`build_session`：cookie 库 → 浏览器桥）与会话校验：`scripts/tmall_session.py`
+- 本地 HTTP 桥（端点 `/ping` `/agent.js` `/next` `/result` `/session` `/call`）：`scripts/browser_bridge.py`
+- 注入到已登录标签页的页面代理：`scripts/bridge_agent.js`
