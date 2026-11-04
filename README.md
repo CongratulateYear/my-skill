@@ -38,6 +38,7 @@ Skill 可以理解为一组可复用的工作说明、脚本、模板和参考�
 | `asset-inventory` | 资产盘算：给出店铺名、支付区间、结算区间后，复用本机浏览器已登录的天猫会话，按固定顺序跑完全部 17 个账单流程（下载 → 写入模板 → 交付），生成固定 30 列表头的公司汇总盘算工作簿与分类明细；登录态失效时用 magpie-browser 在当前已打开的浏览器里自动登录（不开新浏览器、不落盘密码）；支持多店铺按顺序串行执行与断点续跑。 |
 | `fine-export` | 罚款导出：按支付日期从天猫商家处罚中心（rules-center）导出处罚数据与赔付追缴明细，合并为 11 列标准「处罚数据」表（店铺右侧带「类型」列），可直接导入资产盘算工作簿；登录态失效时用 magpie-browser 在当前已打开的浏览器里自动登录（不开新浏览器、不落盘密码）；支持多账户按顺序串行导出与断点续跑。 |
 | `nodeseek-checkin` | NodeSeek 每日签到：用本机 magpie-browser 打开 nodeseek.com 判断登录态（未登录则过 Cloudflare Turnstile 完成登录），进入 /board 点「试试手气」完成签到，并报告获得的鸡腿数与当前排名。依赖 magpie-browser MCP（真实已登录浏览器会话），不使用 chrome-devtools。 |
+| `淘工厂登录` | 淘工厂（tgcwork/tgc.tmall.com）登录与 token 获取：复用本机浏览器已登录的天猫会话（只读本机 cookie 库），登录态失效时用 magpie-browser 在当前已打开的浏览器里自动登录（先判断 magpie-browser 是否可用；不开新浏览器、不落盘密码）。支持公司名校验（--expect-company，简称↔全称互相包含匹配，不匹配报 wrong-company）、账号校验（--expect-account）；登录失败分类处理（滑块验证提示用户手动滑动、账号密码错误提示用户、账号失效提示用户）；cookie/XSRF token/完整请求头可供其他 skill 以子进程 JSON 或 import tmall_session 方式在内存中引用。跨平台：macOS+Chrome（钥匙串 AES-CBC）、Windows+Edge（DPAPI AES-GCM）。 |
 
 ## 推荐目录结构
 
