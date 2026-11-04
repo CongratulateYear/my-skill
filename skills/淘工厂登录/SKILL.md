@@ -1,13 +1,13 @@
 ---
 name: 淘工厂登录
-description: 淘工厂（tgcwork/tgc.tmall.com）登录与 token 获取：默认直接复用本机浏览器已登录的天猫会话（只读本机 cookie 库，无需浏览器在线），登录态失效时用 magpie-browser 在当前已打开的浏览器里自动登录（先判断 magpie-browser 是否可用，不可用给出提示；不开新浏览器、不落盘密码）；支持公司名校验（用户发来公司名称时用 --expect-company 验证登录账号是否属于该公司，不匹配报 wrong-company）；支持账号校验（--expect-account）；登录失败分类处理（滑块验证提示用户滑动、账号密码错误提示用户、账号失效提示用户）；获取的 cookie/XSRF token/完整请求头可供其他 skill 以子进程 JSON 或 import tmall_session 两种方式在内存中引用，绝不落盘。跨平台：macOS+Chrome（钥匙串 AES-CBC）与 Windows+Edge（DPAPI AES-GCM）。当用户说「登录淘工厂/天猫」「获取天猫 token」「拿一下 XSRF」「检查天猫登录态」，或其他 skill 调天猫接口前需要登录态/token 时使用。
+description: 淘工厂（tgcwork/tgc.tmall.com）登录与 token 获取：默认直接复用本机浏览器已登录的天猫会话（只读本机 cookie 库，无需浏览器在线），登录态失效时用 magpie-browser 在当前已经打开的浏览器里自动登录（先判断 magpie-browser 是否可用，不可用给出提示；绝不新开浏览器/新 profile，一律在新开的 Magpie 标签页里操作、不复用已有标签页；不落盘密码）；支持公司名校验（用户发来公司名称时用 --expect-company 验证登录账号是否属于该公司，不匹配报 wrong-company）；支持账号校验（--expect-account）；登录失败分类处理（滑块验证提示用户滑动、账号密码错误提示用户、账号失效提示用户）；获取的 cookie/XSRF token/完整请求头可供其他 skill 以子进程 JSON 或 import tmall_session 两种方式在内存中引用，绝不落盘。跨平台：macOS+Chrome（钥匙串 AES-CBC）与 Windows+Edge（DPAPI AES-GCM）。当用户说「登录淘工厂/天猫」「获取天猫 token」「拿一下 XSRF」「检查天猫登录态」，或其他 skill 调天猫接口前需要登录态/token 时使用。
 ---
 
 # 淘工厂登录（淘工厂登录与 token 获取）
 
 ## 用途
 
-用 magpie-browser 在**用户当前已打开的浏览器**里完成淘工厂（tgcwork.tmall.com）登录，然后从本机浏览器 cookie 库解密出会话，校验并输出可直接调天猫接口的 **XSRF token**（及完整请求头）。用户发来**公司名称**时，登录后必须校验登录账号是否属于该公司。
+用 magpie-browser 在**用户当前已经打开的浏览器**（绝不新开浏览器/新 profile）里、于**新开的 Magpie 标签页**中完成淘工厂（tgcwork.tmall.com）登录，然后从本机浏览器 cookie 库解密出会话，校验并输出可直接调天猫接口的 **XSRF token**（及完整请求头）。用户发来**公司名称**时，登录后必须校验登录账号是否属于该公司。
 
 适用于：
 - 用户说「登录天猫 / 淘工厂」「获取天猫 token」「拿一下 XSRF」「检查天猫登录态」；
@@ -52,7 +52,7 @@ python3 <skill目录>/scripts/ensure_login.py --expect-company 埔鸣
 
 ### 2. 登录动作（仅退出码 3 时）
 
-1. **复用当前浏览器，绝不新开浏览器**：只用 magpie-browser MCP 的 `browser` 工具。先 `tabs` 找有没有 `tgcwork.tmall.com` 标签，**有就 `tab_select` 复用**；没有再 `tab_new`（带 url `https://tgcwork.tmall.com/login`）。不要用 chrome-devtools。
+1. **当前已打开的浏览器 + 新开 Magpie 标签页**：绝不新开浏览器、不新建 profile，也不要用 browser-skill 的 bsk_*（Agent Window 会另开浏览器窗口）。只用 magpie-browser MCP 的 `browser` 工具接管用户**当前已经打开**的那个浏览器（多浏览器时先 `browsers` 再 `use_browser` 选定，之后不换）。登录动作**一律 `tab_new` 新开一个 Magpie 标签页**（带 url `https://tgcwork.tmall.com/login`），**不复用任何已有标签页**：用户自己的标签、`tabs` 里带 `~`（其他 agent 在用）的标签、旧的 tgcwork 登录页标签都不要动。也不要用 chrome-devtools。登录完成并验证通过后，可 `tab_close` 关闭自己开的这个标签页。
 2. **判断登录框状态**：`snapshot`（interactive）读登录页 iframe，里面应有「请输入账号名/手机号/邮箱」「请输入登录密码」「登录」三个元素。
    - 两个输入框都已有值（用户或密码管理器预填）→ 直接进入第 4 步，**不要改动内容**。
    - 输入框为空 → 进入第 3 步。
@@ -78,7 +78,7 @@ python3 <skill目录>/scripts/ensure_login.py --expect-company 埔鸣
 | 提示需要短信验证码 | 二次验证 | 停下来让用户在浏览器里自己输，完成后重跑 `ensure_login.py --wait 30` |
 | 页面无任何错误提示、也没跳转 | 未知 | 重跑 `ensure_login.py --wait 30` 一次；仍失败则 `snapshot` 人工判断 |
 
-登录成功但 `reason` 为 `wrong-company`：说明登录的账号不属于用户给的公司 → 在 tgc.tmall.com 页面退出登录（右上角公司名 → 退出），回到第 2 步换目标公司的账号重新登录。
+登录成功但 `reason` 为 `wrong-company`：说明登录的账号不属于用户给的公司 → 在自己新开的那个 Magpie 标签页里打开 tgc.tmall.com 退出登录（右上角公司名 → 退出），再按第 2 步重新登录（又是新开一个 Magpie 标签页）换目标公司的账号。
 
 若用户明确要求“不要自动登录”，则只提示用户在浏览器里登录一次后重试。除此之外，只有遇到短信/滑块等验证码时才需要人工介入。
 
@@ -132,7 +132,7 @@ python3 <skill目录>/scripts/tmall_token.py --with-headers --expect-company 埔
 - **凭据只在内存**：cookie、XSRF token、请求头绝不写入技能文件、文档、状态文件、普通日志或聊天回复。需要展示时只给 `accountHint`、`company`、`cookieCount`、`hasXsrf` 这类脱敏字段（公司名不是机密，页面右上角本来就在展示）。
 - 不落盘密码：账号密码只在表单里出现一次，不进任何文件。
 - 不绕过验证码：出现短信/滑块/二次验证时停下来让用户自己过。
-- 不新开浏览器实例、不新建 profile：永远接管用户当前已打开的那个浏览器。
+- 不新开浏览器实例、不新建 profile：永远接管用户当前已经打开的那个浏览器；浏览器动作一律在**新开的 Magpie 标签页**里做，不复用、不打扰用户或其他 agent 的标签页。
 
 ## 依赖
 
