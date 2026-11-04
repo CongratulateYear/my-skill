@@ -7,9 +7,9 @@
   淘工厂资产盘算导出罚款  --mode export --module 罚款   登录验证 → 仅导出罚款（处罚数据）
 
 依赖（安装本 skill 时必须一并安装，缺一不可）：
-  淘工厂登录 /Users/rabbit/.agents/skills/淘工厂登录/
-  淘工厂导出 /Users/rabbit/.agents/skills/淘工厂导出/
-  淘工厂合并 /Users/rabbit/.agents/skills/淘工厂合并/
+  淘工厂登录 C:\\Users\\Administrator\\.dsh\\skills/淘工厂登录/
+  淘工厂导出 C:\\Users\\Administrator\\.dsh\\skills/淘工厂导出/
+  淘工厂合并 C:\\Users\\Administrator\\.dsh\\skills/淘工厂合并/
 脚本启动时逐一自检，缺哪个就报清单并退出。
 
 多公司：本脚本一次只处理一家公司。多公司由上层按用户给定顺序逐家调用，
@@ -20,11 +20,12 @@
 """
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
 
-SKILLS_ROOT = Path("/Users/rabbit/.agents/skills")
+SKILLS_ROOT = Path("C:\\Users\\Administrator\\.dsh\\skills")
 DEPENDENCIES = [
     ("淘工厂登录", SKILLS_ROOT / "淘工厂登录" / "scripts" / "ensure_login.py"),
     ("淘工厂导出", SKILLS_ROOT / "淘工厂导出" / "scripts" / "taogongchang_export.py"),
@@ -51,6 +52,32 @@ def check_dependencies() -> None:
 def run(command: list[str]) -> int:
     print("+", " ".join(str(c) for c in command), flush=True)
     return subprocess.run(command).returncode
+
+
+def run_gate(command: list[str]) -> tuple[int, dict]:
+    """跑登录闸门：截获 stdout 的 JSON 状态，失败时把 action 文案带给调用方。"""
+    print("+", " ".join(str(c) for c in command), flush=True)
+    completed = subprocess.run(command, capture_output=True, text=True,
+                               encoding="utf-8", errors="replace")
+    state: dict = {}
+    text = (completed.stdout or "").strip()
+    decoder = json.JSONDecoder()
+    for idx, ch in enumerate(text):
+        if ch != "{":
+            continue
+        try:
+            parsed, _end = decoder.raw_decode(text, idx)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict) and "loggedIn" in parsed:
+            state = parsed
+            break
+    if text:
+        print(text, flush=True)
+    detail = (completed.stderr or "").strip()
+    if detail:
+        print(detail, file=sys.stderr)
+    return completed.returncode, state
 
 
 def main() -> int:
@@ -81,21 +108,22 @@ def main() -> int:
     module = str(args.module).strip()
     is_all_module = module.lower() in ALL_MODULE_WORDS or module in ALL_MODULE_WORDS
 
-    # 1) 登录闸门：导出走浏览器 cookie 库，先确认当前浏览器登录的正是目标公司
+    # 1) 登录闸门：先确认当前浏览器登录的正是目标公司（ensure_login 自带
+    #    cookie 库 → 浏览器桥回退；失败时其 JSON 里的 action 指引会原样转达）
     if args.fetch_file is None:
-        gate = [sys.executable, ensure_login, "--expect-company", args.company_name,
-                "--wait", str(max(args.login_wait, 0.0))]
-        rc = run(gate)
+        gate_cmd = [sys.executable, ensure_login, "--expect-company", args.company_name,
+                    "--wait", str(max(args.login_wait, 0.0))]
+        rc, state = run_gate(gate_cmd)
         if rc == 3:
-            print(
-                "\n需要先完成浏览器登录/切换：按「淘工厂登录」skill 在【当前已打开的浏览器】里"
-                "新开 Magpie 标签页操作（不要新开浏览器）；若当前登录的是别的公司，先在 "
-                "tgc.tmall.com 右上角公司名 → 退出登录，再登目标公司账号。完成后重跑本命令。",
-                file=sys.stderr,
-            )
+            reason = state.get("reason", "未知原因")
+            action = state.get("action") or (
+                "按「淘工厂登录」skill 在【当前已打开的浏览器】里完成登录/切换"
+                "（不要新开浏览器），完成后重跑本命令。")
+            print(f"\n需要先完成浏览器登录/切换（{reason}）：{action}", file=sys.stderr)
             return 3
         if rc != 0:
-            print(f"登录闸门异常（exit {rc}），停止执行", file=sys.stderr)
+            detail = state.get("detail") or state.get("action") or "无详情"
+            print(f"登录闸门异常（exit {rc}）：{detail}", file=sys.stderr)
             return rc
 
     # 2) 导出

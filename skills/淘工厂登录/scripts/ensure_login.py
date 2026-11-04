@@ -10,15 +10,25 @@ Prints ONE JSON object on stdout so callers can branch on it, and exits with:
                   magpie-browser in the *already open* browser
   1  ERROR        unexpected failure (keychain / DPAPI / decrypt / cookie db)
 
+Transport: --transport auto (default) reads the local cookie store first and
+falls back to the browser bridge (asset-inventory's browser_bridge.py + an
+injected agent in the logged-in tgc.tmall.com tab) when the store cannot be
+read at all (Windows v20 app-bound encryption, Edge-exclusive Cookies file,
+sandbox denying the temp area).
+
 This script never opens a browser window, never launches a second browser, and
 never touches a password: driving the form is the agent's job (SKILL.md
 「登录流程」). It only reports state, plus the concrete next `action` for the
 agent, and can optionally wait for the login to land so the caller does not
-race the browser. Pass `--expect-account <hint>` so a still-logged-in previous
-account is reported as `wrong-account` instead of a false success. Pass
-`--expect-company <名称>` (user usually sends the short company/shop name,
-e.g. 埔鸣) so a logged-in session of a DIFFERENT company is reported as
-`wrong-company` instead of a false success.
+race the browser. Pass `--expect-account <手机号或账号提示>` so a
+still-logged-in previous account is reported as `wrong-account` instead of a
+false success: phone numbers are compared against the platform's masked
+erpMobile (accountInfo.dingdingMobile), non-phone hints against the cookie
+hint; when neither is comparable the result is `accountCheck: unverified`
+(non-blocking) instead of a false wrong-account. Pass `--expect-company <名称>`
+(user usually sends the short company/shop name, e.g. 埔鸣) so a logged-in
+session of a DIFFERENT company is reported as `wrong-company` instead of a
+false success.
 """
 from __future__ import annotations
 
@@ -45,6 +55,14 @@ ACTION = {
         "tgcwork.tmall.com 标签，没有就 tab_new 在【当前这个已经打开的浏览器】里"
         f"打开 {LOGIN_URL}（不要新开浏览器、不要用 chrome-devtools），登录后重跑本命令。"
     ),
+    "no-session": (
+        "本机读不到登录态，浏览器桥也未接入。两条路任选其一："
+        "① 用 magpie-browser 找 tgcwork.tmall.com 标签（没有就 tab_new 在【当前已打开的"
+        f"浏览器】里打开 {LOGIN_URL}）完成登录后重跑本命令；"
+        "② 浏览器里其实已登录时，后台启动 asset-inventory 的 browser_bridge.py"
+        "（默认端口 8899），再在已登录的 tgc.tmall.com 标签里用 evaluate 注入"
+        " <script src=http://127.0.0.1:8899/agent.js></script>，然后重跑本命令。"
+    ),
     "expired": (
         "天猫登录 cookie 还在但已过期。用 magpie-browser 复用现有的 "
         f"tgcwork.tmall.com 标签（没有就 tab_new 一个，仍在当前浏览器里）打开 {LOGIN_URL} "
@@ -67,9 +85,26 @@ ACTION = {
 }
 
 
-def probe(browser: str, domain: str) -> dict[str, object]:
+def probe(
+    browser: str,
+    domain: str,
+    transport: str = "auto",
+    bridge_url: str | None = None,
+) -> dict[str, object]:
     try:
-        headers = tmall_session.build_headers(browser, domain)
+        built = tmall_session.build_session(transport, browser, domain, bridge_url)
+    except tmall_session.BridgeSessionError as exc:
+        # 保留完整多行错误清单（每条浏览器路线的死因），只截长度不砍行。
+        detail = "\n".join(str(exc).splitlines())[:1200] if str(exc) else "未知原因"
+        return {
+            "loggedIn": False,
+            "reason": "no-session",
+            "detail": detail,
+            "accountHint": "",
+            "cookieCount": 0,
+            "hasXsrf": False,
+            "action": ACTION["no-session"],
+        }
     except tmall_session.SessionError as exc:
         detail = str(exc).splitlines()[0] if str(exc) else "未知原因"
         return {
@@ -81,18 +116,24 @@ def probe(browser: str, domain: str) -> dict[str, object]:
             "hasXsrf": False,
             "action": ACTION["no-cookie"],
         }
-    ok = tmall_session.check_session(headers)
+    headers = built["headers"]
+    session = built["session"]
+    ok = tmall_session.check_session(headers, session)
     company = ""
     company_detail = ""
+    erp_mobile = ""
     if ok:
-        info = tmall_session.fetch_company(headers)
+        info = tmall_session.fetch_company(headers, session)
         company = info["company"]
         company_detail = info["detail"]
+        erp_mobile = info.get("erpMobile", "")
     return {
         "loggedIn": ok,
         "reason": "logged-in" if ok else "expired",
         "detail": "",
+        "transport": built["transport"],
         "accountHint": tmall_session.account_hint(headers),
+        "erpMobile": erp_mobile,
         "cookieCount": len(str(headers.get("cookie", "")).split("; ")),
         "hasXsrf": "x-xsrf-token" in headers,
         "company": company,
@@ -102,14 +143,25 @@ def probe(browser: str, domain: str) -> dict[str, object]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:  # noqa: BLE001 - non-fatal convenience
+                pass
+
     parser = argparse.ArgumentParser(description="检查天猫登录态；未登录时给出 agent 的下一步动作")
     parser.add_argument("--browser", default="auto", choices=[*tmall_session.BROWSERS, "auto"])
     parser.add_argument("--domain", default=tmall_session.DEFAULT_DOMAIN)
+    parser.add_argument("--transport", default="auto", choices=tmall_session.TRANSPORTS,
+                        help="auto=cookie 库优先、失败回退浏览器桥；cookie=只读 cookie 库；bridge=只用页面桥")
+    parser.add_argument("--bridge-url", default="", help="桥地址，默认 http://127.0.0.1:8899")
     parser.add_argument("--wait", type=float, default=0.0,
                         help="浏览器里刚点完登录时，最多等这么多秒让 cookie 落库")
     parser.add_argument("--interval", type=float, default=2.0, help="轮询间隔秒数")
     parser.add_argument("--expect-account", default="",
-                        help="期望登录的账号提示；不一致时判为 wrong-account（换号场景用）")
+                        help="期望登录的账号（手机号或账号提示）；手机号只与平台脱敏 erpMobile 比对，"
+                             "比对不上时报 unverified 而不是 wrong-account")
     parser.add_argument("--expect-company", default="",
                         help="期望的公司/店铺名（用户通常发简称，如「埔鸣」）；"
                              "登录的公司不匹配时判为 wrong-company")
@@ -118,15 +170,24 @@ def main(argv: list[str] | None = None) -> int:
     started = time.monotonic()
     expected = args.expect_account.strip()
     expected_company = args.expect_company.strip()
+    bridge_url = args.bridge_url or None
 
     def judge(state: dict) -> dict:
-        if expected and state["loggedIn"] and state["accountHint"] != expected:
-            state.update({
-                "loggedIn": False,
-                "reason": "wrong-account",
-                "expectedAccount": expected,
-                "action": ACTION["wrong-account"],
-            })
+        if expected and state["loggedIn"]:
+            verdict = tmall_session.account_verdict(
+                expected, str(state.get("erpMobile") or ""), str(state.get("accountHint") or ""))
+            if verdict == "mismatch":
+                state.update({
+                    "loggedIn": False,
+                    "reason": "wrong-account",
+                    "expectedAccount": expected,
+                    "action": ACTION["wrong-account"],
+                })
+            elif verdict == "unverified":
+                state["accountCheck"] = (
+                    f"unverified：无法核对账号（expected={expected}，erpMobile/提示均不可比），未阻断")
+            else:
+                state["accountCheck"] = "ok"
         if expected_company and state["loggedIn"]:
             actual_company = str(state.get("company") or "")
             if not actual_company:
@@ -147,13 +208,13 @@ def main(argv: list[str] | None = None) -> int:
         return state
 
     try:
-        state = judge(probe(args.browser, args.domain))
+        state = judge(probe(args.browser, args.domain, args.transport, bridge_url))
         terminal = {"wrong-account", "wrong-company", "company-unknown"}
         deadline = started + max(args.wait, 0.0)
         while not state["loggedIn"] and state.get("reason") not in terminal \
                 and time.monotonic() < deadline:
             time.sleep(max(min(args.interval, 5.0), 0.5))
-            state = judge(probe(args.browser, args.domain))
+            state = judge(probe(args.browser, args.domain, args.transport, bridge_url))
     except Exception as exc:  # never leak a traceback into the agent's JSON
         print(json.dumps({
             "loggedIn": False,
@@ -171,7 +232,8 @@ def main(argv: list[str] | None = None) -> int:
     print(json.dumps(state, ensure_ascii=False, indent=2))
     if state["loggedIn"]:
         suffix = f"（{state.get('company', '')}）" if state.get("company") else ""
-        print(f"登录态有效：{state['accountHint']}{suffix}", file=sys.stderr)
+        via = f" [via {state.get('transport', '')}]" if state.get("transport") else ""
+        print(f"登录态有效：{state['accountHint']}{suffix}{via}", file=sys.stderr)
         return EXIT_OK
     print(f"需要登录（{state['reason']}）：{state['detail'] or state['accountHint']}", file=sys.stderr)
     return EXIT_NEED_LOGIN

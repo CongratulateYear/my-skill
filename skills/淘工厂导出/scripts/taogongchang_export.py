@@ -7,8 +7,8 @@
 1. 解析参数：--module 支持中文名（罚款/商品贷款/全部 等），公司名与日期原样透传；
 2. 生成唯一输出文件夹 `<输出根>/<公司名称>_<结算开始>_<结算结束>/`
    （只给支付日期时后缀用支付区间）；
-3. 调 asset-inventory 的 tmall_bill_download.py --no-pan-suan 完成查询、创建任务、
-   轮询、下载与安全解压（处罚数据/商品效果导出走各自专属链路）。
+3. 调内置的 tmall_bill_download.py（源自 asset-inventory）--no-pan-suan 完成查询、
+   创建任务、轮询、下载与安全解压（处罚数据/商品效果导出走各自专属链路）。
 
 本脚本不写盘算工作簿；不读取、不回显 fetch 文件内容（路径直接透传给下载脚本，
 cookie 只在下载脚本内存中使用）；不落盘任何凭据。
@@ -22,9 +22,13 @@ import subprocess
 import sys
 from pathlib import Path
 
-DOWNLOAD_SCRIPT = Path(
-    "/Users/rabbit/.agents/skills/asset-inventory/scripts/tmall_bill_download.py"
-)
+# 下载内核已随本 skill 内置（源自 asset-inventory，--no-pan-suan 纯导出模式）；
+# asset-inventory skill 若还装着，其副本作为兼容回退。
+DOWNLOAD_SCRIPT = Path(__file__).resolve().with_name("tmall_bill_download.py")
+if not DOWNLOAD_SCRIPT.is_file():
+    DOWNLOAD_SCRIPT = Path(
+        "C:\\Users\\Administrator\\.dsh\\skills/asset-inventory/scripts/tmall_bill_download.py"
+    )
 
 # 中文名/别名 -> tmall_bill_download.py 的 --module 值
 MODULE_ALIASES = {

@@ -1,15 +1,15 @@
 ---
-name: 淘工厂合并
-description: 把多个淘工厂 Excel 合并成一个盘算式工作簿（xlsx）。汇总逻辑复用「资产盘算」skill：以盘算模板为底，产出「公司汇总」Sheet（30 列固定表头、商品行公式、总计行）+ 各流程明细 Sheet + 费用归集等模板页。文件来源两种：①用户直接给文件路径；②用「淘工厂导出」skill 生成的导出文件夹（默认 ~/Downloads/淘工厂导出/<公司名称>_<结算开始>_<结算结束>/，按公司名称+结算日期自动定位）。合并后文件名为「公司名称_结算日期.xlsx」；公司名称和结算日期都由用户在消息里给出，结算日期没给就用当天日期。纯本地合并，不需要登录态。当用户说「淘工厂合并」「合并导出的文件」「把这几个 excel 合并成一个」等合并需求时使用。
+name: taogongchang-merge
+description: 把多个淘工厂 Excel 合并成一个盘算式工作簿（xlsx）。汇总逻辑复用资产盘算构建器（已内置本 skill）：以盘算模板为底，产出「公司汇总」Sheet（30 列固定表头、商品行公式、总计行）+ 各流程明细 Sheet + 费用归集等模板页。文件来源两种：①用户直接给文件路径；②用「淘工厂导出」skill 生成的导出文件夹（默认 ~/Downloads/淘工厂导出/<公司名称>_<结算开始>_<结算结束>/，按公司名称+结算日期自动定位）。合并后文件名为「公司名称_结算日期.xlsx」；公司名称和结算日期都由用户在消息里给出，结算日期没给就用当天日期。纯本地合并，不需要登录态。当用户说「淘工厂合并」「合并导出的文件」「把这几个 excel 合并成一个」等合并需求时使用。
 ---
 
 # 淘工厂合并
 
 ## 用途
 
-把淘工厂导出的流程 xlsx 合并成一个**盘算式工作簿**：复用「资产盘算」skill 的
-`pan_suan_builder.py`（`/Users/rabbit/.agents/skills/asset-inventory/scripts/pan_suan_builder.py`），
-以 `asset-inventory/assets/盘算模板.xlsx` 为底，把各流程明细写入对应 Sheet，并重建
+把淘工厂导出的流程 xlsx 合并成一个**盘算式工作簿**：用本 skill 自带的
+`scripts/pan_suan_builder.py`（源自 asset-inventory，已内置，无需再装），
+以 `assets/盘算模板.xlsx` 为底，把各流程明细写入对应 Sheet，并重建
 **「公司汇总」Sheet**——30 列固定表头、按商品逐行的 SUMIFS 公式、紧贴数据的「总计」行，
 保留模板 55 行结构。**纯本地操作**：不需要登录态、不联网；要重新导出文件用「淘工厂导出」skill。
 
@@ -27,13 +27,13 @@ description: 把多个淘工厂 Excel 合并成一个盘算式工作簿（xlsx�
 
 ```bash
 # 方式1：用户直接给文件
-python3 /Users/rabbit/.agents/skills/淘工厂合并/scripts/merge_excel.py \
+python3 C:\\Users\\Administrator\\.dsh\\skills/淘工厂合并/scripts/merge_excel.py \
   --company-name 埔鸣 \
   --settlement-date 2026-09-01_2026-10-31 \
   --files /path/交易佣金.xlsx /path/商品贷款.xlsx
 
 # 方式2：合并「淘工厂导出」生成的文件夹（结算日期没给 → 当天）
-python3 /Users/rabbit/.agents/skills/淘工厂合并/scripts/merge_excel.py \
+python3 C:\\Users\\Administrator\\.dsh\\skills/淘工厂合并/scripts/merge_excel.py \
   --company-name 埔鸣 \
   --settlement-date 2026-09-01_2026-10-31
 
@@ -58,4 +58,4 @@ python3 /Users/rabbit/.agents/skills/淘工厂合并/scripts/merge_excel.py \
 - 含「公司汇总」Sheet 的文件（如上次合并的输出）不会被再次吞入。
 - **所有商品效果数据导出.xlsx 缺工作表 dimension**：pan_suan_builder 已处理（read_only 误读时回退全量加载）。
 - 运行脚本用 `python3` 即可，实际盘算构建在带 openpyxl 的 Python 里执行（`CODEX_SPREADSHEET_PYTHON` 可强制指定）。
-- 依赖「资产盘算」skill 在 `/Users/rabbit/.agents/skills/asset-inventory/`（pan_suan_builder.py + 盘算模板.xlsx）。
+- `pan_suan_builder.py` 与 `assets/盘算模板.xlsx` 已内置本 skill（`scripts/` 与 `assets/`），不依赖 asset-inventory；子进程统一以 UTF-8 编码通信（Windows GBK 控制台下也不会崩）。

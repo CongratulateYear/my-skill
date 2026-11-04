@@ -1,5 +1,5 @@
 ---
-name: 淘工厂资产盘算
+name: taogongchang-pansuan
 description: 淘工厂资产盘算总编排：串联 淘工厂登录 → 淘工厂导出 → 淘工厂合并 三个 skill，按公司产出盘算工作簿。三种调用：①「淘工厂资产盘算」= 全流程（登录验证→导出17流程→合并成盘算式工作簿）；②「淘工厂资产盘算导出」= 登录+导出（不合并）；③「淘工厂资产盘算导出罚款」= 登录+只导出罚款（处罚数据）。支持单公司与多公司：多公司必须按用户给定顺序串行执行，上一家全部完成（含合并）才能开始下一家。依赖三个 skill——淘工厂登录、淘工厂导出、淘工厂合并；下载/安装本 skill 时会自动一并安装这三个，缺一不可。
 ---
 
@@ -11,9 +11,9 @@ description: 淘工厂资产盘算总编排：串联 淘工厂登录 → 淘工�
 
 | 依赖 | 位置 | 作用 |
 |---|---|---|
-| 淘工厂登录 | `/Users/rabbit/.agents/skills/淘工厂登录/` | magpie-browser 登录/切换公司；`ensure_login.py` 登录闸门；cookie 库解密 |
-| 淘工厂导出 | `/Users/rabbit/.agents/skills/淘工厂导出/` | `taogongchang_export.py` 17 个账单流程导出到单一文件夹 |
-| 淘工厂合并 | `/Users/rabbit/.agents/skills/淘工厂合并/` | `merge_excel.py` 合并成盘算式工作簿（公司汇总 30 列 + 流程 Sheet） |
+| 淘工厂登录 | `C:\\Users\\Administrator\\.dsh\\skills/淘工厂登录/` | magpie-browser 登录/切换公司；`ensure_login.py` 登录闸门（cookie 库读不到时自动回退浏览器桥）；cookie 库解密 |
+| 淘工厂导出 | `C:\\Users\\Administrator\\.dsh\\skills/淘工厂导出/` | `taogongchang_export.py` 17 个账单流程导出到单一文件夹（下载器已内置） |
+| 淘工厂合并 | `C:\\Users\\Administrator\\.dsh\\skills/淘工厂合并/` | `merge_excel.py` 合并成盘算式工作簿（公司汇总 30 列 + 流程 Sheet；构建器与模板已内置） |
 
 流水线脚本每次运行都会自检依赖，缺哪个会报出确切路径和补装指引；发现缺失时按提示补装，不要绕过。
 
@@ -38,11 +38,11 @@ description: 淘工厂资产盘算总编排：串联 淘工厂登录 → 淘工�
 ### 单公司
 
 1. 需要时先按「淘工厂登录」skill 登录/切换到目标公司（当前已打开的浏览器、新开 Magpie 标签页；wrong-company 时右上角公司名 → 退出登录再登目标账号）。
-2. 跑流水线（登录闸门在脚本里自动执行，未登录/公司不符会以 exit 3 停下并给出指引）：
+2. 跑流水线（登录闸门在脚本里自动执行；未登录/公司不符/两路登录态都拿不到会以 exit 3 停下，并把 `ensure_login.py` 的 `reason` 和 `action` 指引原样转出——cookie 库被锁或 v20 加密时按指引起浏览器桥：后台跑 `淘工厂登录/scripts/browser_bridge.py --port 8899`，再对已登录 tgc 标签页注入 `http://127.0.0.1:8899/agent.js`）：
 
 ```bash
 # 淘工厂资产盘算（全流程）
-python3 /Users/rabbit/.agents/skills/淘工厂资产盘算/scripts/pansuan_pipeline.py \
+python3 C:\\Users\\Administrator\\.dsh\\skills/淘工厂资产盘算/scripts/pansuan_pipeline.py \
   --company-name 埔鸣 \
   --order-pay-start 2026-09-01 --order-pay-end 2026-09-30 \
   --write-off-start 2026-09-01 --write-off-end 2026-10-31

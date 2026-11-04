@@ -1,13 +1,13 @@
 ---
-name: 淘工厂导出
-description: 从淘工厂导出17类账单/数据文件（消费者体验提升服务、商品贷款、交易补贴、交易佣金、先用后付、新疆物流集运、评价有礼、营销费用、商业化账户充值提现、投流推广佣金、淘客推广佣金、直播推广佣金、客服服务费、赔付追缴、处罚数据、出海增值服务费、所有商品效果数据导出）。公司名称、支付日期、结算日期全部由用户在消息里发送（不从登录态解析）；登录态默认通过「淘工厂登录」skill 从本机浏览器 cookie 库自动获取（含 HttpOnly cookie），也支持用户直接贴 queryBillDetail fetch（cookie 只在内存/临时文件中使用，绝不落盘、不回显）。默认一次执行全部17个流程，用户指定单一流程时（如「淘工厂导出罚款」）只执行该流程。所有导出文件统一放入一个文件夹，文件夹名为「公司名称_结算开始_结算结束」。当用户说「淘工厂导出」「导出淘工厂账单」「淘工厂导出罚款/处罚数据/商品贷款」等导出淘工厂文件的需求时使用；只导出文件、不写盘算工作簿（盘算请用 asset-inventory）。
+name: taogongchang-export
+description: 从淘工厂导出17类账单/数据文件（消费者体验提升服务、商品贷款、交易补贴、交易佣金、先用后付、新疆物流集运、评价有礼、营销费用、商业化账户充值提现、投流推广佣金、淘客推广佣金、直播推广佣金、客服服务费、赔付追缴、处罚数据、出海增值服务费、所有商品效果数据导出）。公司名称、支付日期、结算日期全部由用户在消息里发送（不从登录态解析）；登录态默认通过「淘工厂登录」skill 自动获取（本机 cookie 库读不到时自动回退浏览器桥，含 HttpOnly cookie），也支持用户直接贴 queryBillDetail fetch（cookie 只在内存/临时文件中使用，绝不落盘、不回显）。默认一次执行全部17个流程，用户指定单一流程时（如「淘工厂导出罚款」）只执行该流程。所有导出文件统一放入一个文件夹，文件夹名为「公司名称_结算开始_结算结束」。当用户说「淘工厂导出」「导出淘工厂账单」「淘工厂导出罚款/处罚数据/商品贷款」等导出淘工厂文件的需求时使用；只导出文件、不写盘算工作簿（盘算请用「淘工厂合并」或「淘工厂资产盘算」）。
 ---
 
 # 淘工厂导出
 
 ## 用途
 
-把资产盘算的 17 个账单下载流程抽出来做成**纯导出**：查询 → 创建明细任务 → 轮询 → 下载 → 安全解压，**不写盘算工作簿**（需要盘算汇总时用 asset-inventory skill）。所有导出文件统一放进一个文件夹：`<输出根>/<公司名称>_<结算开始>_<结算结束>/`。
+把资产盘算的 17 个账单下载流程抽出来做成**纯导出**：查询 → 创建明细任务 → 轮询 → 下载 → 安全解压，**不写盘算工作簿**（需要盘算汇总时用「淘工厂合并」或「淘工厂资产盘算」skill）。所有导出文件统一放进一个文件夹：`<输出根>/<公司名称>_<结算开始>_<结算结束>/`。
 
 ## 输入（全部来自用户消息，缺了就先问，不要自行编造、不从登录态解析）
 
@@ -18,7 +18,7 @@ description: 从淘工厂导出17类账单/数据文件（消费者体验提升�
 
 ## 登录态：一律通过「淘工厂登录」skill
 
-- 判据只用脚本：`python3 /Users/rabbit/.agents/skills/淘工厂登录/scripts/ensure_login.py`（退出码 0=有效 / 3=需登录 / 1=脚本错）。
+- 判据只用脚本：`python3 C:\\Users\\Administrator\\.dsh\\skills/淘工厂登录/scripts/ensure_login.py`（退出码 0=有效 / 3=需登录 / 1=脚本错）。
 - 需要登录时按「淘工厂登录」skill 的流程做：**当前已打开的浏览器**（绝不新开浏览器/新 profile）里**新开一个 Magpie 标签页**走 https://tgcwork.tmall.com/login 登录，不复用任何已有标签页；凭据用用户本轮消息里给的账号密码；滑块/短信让用户自己过；登录后 `ensure_login.py --wait 30` 确认再重跑导出。
 
 ## 流程名映射（用户中文说法 → --module）
@@ -50,20 +50,20 @@ description: 从淘工厂导出17类账单/数据文件（消费者体验提升�
 
 ```bash
 # 默认全部17个流程（公司名称与日期都取用户消息）
-python3 /Users/rabbit/.agents/skills/淘工厂导出/scripts/taogongchang_export.py \
+python3 C:\\Users\\Administrator\\.dsh\\skills/淘工厂导出/scripts/taogongchang_export.py \
   --company-name 埔鸣 \
   --write-off-start 2026-07-01 --write-off-end 2026-07-31 \
   --order-pay-start 2026-07-01 --order-pay-end 2026-07-31 \
   --output-root /path/to/outputs
 
 # 指定单一流程（例如用户说「淘工厂导出罚款」，罚款只要支付日期）
-python3 /Users/rabbit/.agents/skills/淘工厂导出/scripts/taogongchang_export.py \
+python3 C:\\Users\\Administrator\\.dsh\\skills/淘工厂导出/scripts/taogongchang_export.py \
   --module 罚款 --company-name 埔鸣 \
   --order-pay-start 2026-07-01 --order-pay-end 2026-07-31 \
   --output-root /path/to/outputs
 
 # 用户贴了 fetch：存临时文件传入（用后即删，绝不回显内容）
-python3 /Users/rabbit/.agents/skills/淘工厂导出/scripts/taogongchang_export.py \
+python3 C:\\Users\\Administrator\\.dsh\\skills/淘工厂导出/scripts/taogongchang_export.py \
   --company-name 埔鸣 --fetch-file /tmp/fetch.txt \
   --write-off-start 2026-07-01 --write-off-end 2026-07-31 \
   --order-pay-start 2026-07-01 --order-pay-end 2026-07-31 \
@@ -73,7 +73,7 @@ python3 /Users/rabbit/.agents/skills/淘工厂导出/scripts/taogongchang_export
 ... --resume
 ```
 
-脚本内部调用 asset-inventory 的 `tmall_bill_download.py --no-pan-suan` 完成实际下载；17 个流程的固定顺序、billType、日期规则、轮询与安全解压全部沿用 asset-inventory 的定义。
+脚本内部调用**本 skill 自带**的 `scripts/tmall_bill_download.py --no-pan-suan` 完成实际下载（源自 asset-inventory，已内置，无需再装）；17 个流程的固定顺序、billType、日期规则、轮询与安全解压全部沿用原定义。下载器的 `--transport auto` 与「淘工厂登录」一致：cookie 库读不到时自动回退浏览器桥。
 
 ## 输出
 
@@ -91,5 +91,6 @@ python3 /Users/rabbit/.agents/skills/淘工厂导出/scripts/taogongchang_export
 
 ## 依赖
 
-- Python 3.11+，`cryptography`、`openpyxl`（与 asset-inventory 相同；缺依赖时按其 SKILL.md 用 uv 建 venv）。
-- 依赖两个同级 skill：「淘工厂登录」（登录态与公司名）与「asset-inventory」（`scripts/tmall_bill_download.py` 实际下载）。这两个 skill 被移动/重命名时本 skill 的脚本路径要同步更新。
+- Python 3.11+，`cryptography`、`openpyxl`（缺依赖时用 uv 建 venv：`uv venv /tmp/tgexport-venv --python 3.12 && uv pip install --python /tmp/tgexport-venv/bin/python cryptography openpyxl`）。
+- 依赖同级 skill：「淘工厂登录」（登录态闸门与公司名校验）。下载器 `tmall_bill_download.py`（及其依赖 `tmall_session.py`、`_bootstrap.py`、`browser_bridge.py`、`bridge_agent.js`）已随本 skill 内置在 `scripts/`，不依赖 asset-inventory。
+- 共享 vendor 目录 `<skills根>/.vendor`（装淘工厂登录 skill 时已就位）。

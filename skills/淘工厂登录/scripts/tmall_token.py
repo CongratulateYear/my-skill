@@ -32,6 +32,7 @@ import json
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -43,11 +44,21 @@ EXIT_NEED_LOGIN = 3
 
 
 def main(argv: list[str] | None = None) -> int:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:  # noqa: BLE001 - non-fatal convenience
+                pass
+
     parser = argparse.ArgumentParser(description="获取当前浏览器天猫会话的 XSRF token（不落盘）")
     parser.add_argument("--browser", default="auto", choices=[*tmall_session.BROWSERS, "auto"])
     parser.add_argument("--domain", default=tmall_session.DEFAULT_DOMAIN)
+    parser.add_argument("--transport", default="auto", choices=tmall_session.TRANSPORTS,
+                        help="auto=cookie 库优先、失败回退浏览器桥；cookie=只读 cookie 库；bridge=只用页面桥")
+    parser.add_argument("--bridge-url", default="", help="桥地址，默认 http://127.0.0.1:8899")
     parser.add_argument("--expect-account", default="",
-                        help="期望登录的账号提示；不一致时输出 wrong-account 并退出 3")
+                        help="期望登录的账号（手机号或账号提示）；不一致时输出 wrong-account 并退出 3")
     parser.add_argument("--expect-company", default="",
                         help="期望的公司/店铺名（通常为简称，如「埔鸣」）；"
                              "不匹配时输出 wrong-company 并退出 3")
@@ -62,32 +73,45 @@ def main(argv: list[str] | None = None) -> int:
     expected = args.expect_account.strip()
     expected_company = args.expect_company.strip()
     company_seen: list[str] = []  # stash from fetch() so we do not hit the API twice
+    note_seen: list[str] = []
 
-    def fetch() -> tuple[bool, str, dict]:
+    def fetch() -> tuple[bool, str, dict, Any]:
         try:
-            headers = tmall_session.build_headers(args.browser, args.domain)
+            built = tmall_session.build_session(
+                args.transport, args.browser, args.domain, args.bridge_url or None)
+        except tmall_session.BridgeSessionError as exc:
+            return False, f"no-session: {str(exc).splitlines()[0]}", {}, None
         except tmall_session.SessionError as exc:
-            return False, f"no-cookie: {str(exc).splitlines()[0]}", {}
-        if not tmall_session.check_session(headers):
-            return False, "expired", headers
-        if expected and tmall_session.account_hint(headers) != expected:
-            return False, "wrong-account", headers
+            return False, f"no-cookie: {str(exc).splitlines()[0]}", {}, None
+        headers = built["headers"]
+        if not tmall_session.check_session(headers, built["session"]):
+            return False, "expired", headers, built["session"]
+        info: dict = {}
+        if expected or expected_company:
+            info = tmall_session.fetch_company(headers, built["session"])
+        if expected:
+            verdict = tmall_session.account_verdict(
+                expected, info.get("erpMobile", ""), tmall_session.account_hint(headers))
+            if verdict == "mismatch":
+                return False, "wrong-account", headers, built["session"]
+            if verdict == "unverified":
+                note_seen[:] = [
+                    f"账号未能核对（expected={expected}，erpMobile/hint 均不可比），未阻断"]
         if expected_company:
-            info = tmall_session.fetch_company(headers)
-            company_seen[:] = [info["company"]]
-            if not info["company"]:
-                return False, "company-unknown", headers
+            company_seen[:] = [info.get("company", "")]
+            if not info.get("company"):
+                return False, "company-unknown", headers, built["session"]
             if not tmall_session.company_matches(expected_company, info["company"]):
-                return False, "wrong-company", headers
-        return True, "logged-in", headers
+                return False, "wrong-company", headers, built["session"]
+        return True, "logged-in", headers, built["session"]
 
     try:
-        ok, reason, headers = fetch()
+        ok, reason, headers, _session = fetch()
         terminal = {"wrong-account", "wrong-company", "company-unknown"}
         deadline = started + max(args.wait, 0.0)
         while not ok and reason not in terminal and time.monotonic() < deadline:
             time.sleep(max(min(args.interval, 5.0), 0.5))
-            ok, reason, headers = fetch()
+            ok, reason, headers, _session = fetch()
     except Exception as exc:
         print(json.dumps({
             "ok": False,
@@ -119,6 +143,8 @@ def main(argv: list[str] | None = None) -> int:
         "xsrfToken": headers.get("x-xsrf-token", ""),
         "waitedSeconds": round(time.monotonic() - started, 1),
     }
+    if note_seen:
+        payload["note"] = note_seen[0]
     if args.with_headers:
         payload["headers"] = headers
     print(json.dumps(payload, ensure_ascii=False, indent=2))

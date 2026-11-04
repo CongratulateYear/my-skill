@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """淘工厂合并：把淘工厂导出的流程 xlsx 合并成一个盘算式工作簿。
 
-汇总逻辑复用「资产盘算」skill 的 pan_suan_builder.py：以 盘算模板.xlsx 为底，
-把各流程明细写入对应 Sheet，并按 30 列固定表头重建「公司汇总」
-（商品行 SUMIFS 公式 + 总计行）——与资产盘算产出的结构一致。
+汇总逻辑用本 skill 内置的 pan_suan_builder.py（源自「资产盘算」skill）：
+以 盘算模板.xlsx 为底，把各流程明细写入对应 Sheet，并按 30 列固定表头重建
+「公司汇总」（商品行 SUMIFS 公式 + 总计行）——与资产盘算产出的结构一致。
 
 文件来源两种：
 1. 用户直接给文件（--files a.xlsx b.xlsx …）
@@ -31,9 +31,16 @@ from pathlib import Path
 from typing import Any
 
 EXPORT_ROOT_DEFAULT = Path("~/Downloads/淘工厂导出").expanduser()
-ASSET_INVENTORY_SKILL = Path("/Users/rabbit/.agents/skills/asset-inventory")
-PAN_SUAN_BUILDER = ASSET_INVENTORY_SKILL / "scripts" / "pan_suan_builder.py"
-PAN_SUAN_TEMPLATE = ASSET_INVENTORY_SKILL / "assets" / "盘算模板.xlsx"
+# 合并内核已随本 skill 内置（源自 asset-inventory 的 pan_suan_builder.py +
+# 盘算模板.xlsx）；asset-inventory skill 若还在，其副本作为兼容回退。
+_SKILL_ROOT = Path(__file__).resolve().parents[1]
+PAN_SUAN_BUILDER = _SKILL_ROOT / "scripts" / "pan_suan_builder.py"
+PAN_SUAN_TEMPLATE = _SKILL_ROOT / "assets" / "盘算模板.xlsx"
+if not PAN_SUAN_BUILDER.is_file() or not PAN_SUAN_TEMPLATE.is_file():
+    _LEGACY = Path("C:\\Users\\Administrator\\.dsh\\skills/asset-inventory")
+    if (_LEGACY / "scripts" / "pan_suan_builder.py").is_file():
+        PAN_SUAN_BUILDER = _LEGACY / "scripts" / "pan_suan_builder.py"
+        PAN_SUAN_TEMPLATE = _LEGACY / "assets" / "盘算模板.xlsx"
 
 DEFAULT_SPREADSHEET_PYTHON = Path(
     "/Users/rabbit/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3"
@@ -153,7 +160,12 @@ def run_builder(
         command.append("--no-recalculate")
     for path in sources:
         command.extend(["--input", str(path)])
-    completed = subprocess.run(command, text=True, capture_output=True, check=False)
+    # 子进程强制 UTF-8 输出 + 父进程按 UTF-8 解码：Windows 控制台默认 GBK，
+    # 含中文的 JSON（ensure_ascii=False）曾按 GBK 解出 0xb0 崩溃。
+    child_env = dict(os.environ)
+    child_env["PYTHONUTF8"] = "1"
+    completed = subprocess.run(command, text=True, capture_output=True, check=False,
+                               encoding="utf-8", errors="replace", env=child_env)
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout).strip()
         raise RuntimeError(f"盘算构建失败：{detail[-2000:]}")
