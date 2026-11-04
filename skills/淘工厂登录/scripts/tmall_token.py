@@ -103,7 +103,7 @@ def main(argv: list[str] | None = None) -> int:
             "reason": reason,
             "accountHint": tmall_session.account_hint(headers) if headers else "",
             "loginUrl": "https://tgcwork.tmall.com/login",
-            "action": "先按 tmall-login skill 的登录流程用 magpie-browser 登录，再重跑本命令。",
+            "action": "先按「淘工厂登录」skill 的登录流程用 magpie-browser 登录，再重跑本命令。",
             "waitedSeconds": round(time.monotonic() - started, 1),
         }
         print(json.dumps(payload, ensure_ascii=False, indent=2))
