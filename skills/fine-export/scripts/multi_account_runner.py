@@ -88,14 +88,16 @@ def load_accounts(path: Path) -> list[dict[str, Any]]:
     return normalized
 
 
-def session_snapshot(browser: str = "chrome") -> dict[str, Any]:
+def session_snapshot(browser: str = "auto", transport: str = "auto",
+                     bridge_url: str | None = None) -> dict[str, Any]:
     """读取当前浏览器登录态与 token（不打印、不落盘任何凭据）。
 
-    统一走 ensure_login.probe，避免和登录闸门各写一套判据。
+    统一走 ensure_login.probe，避免和登录闸门各写一套判据。transport=auto 时
+    cookie 库优先，被 v20 加密或 Edge 独占挡住就回退浏览器桥。
     """
     import ensure_login
 
-    state = ensure_login.probe(browser, tmall_session_domain())
+    state = ensure_login.probe(browser, tmall_session_domain(), transport, bridge_url)
     return {
         "loggedIn": state["loggedIn"],
         "hint": state["accountHint"],
@@ -103,6 +105,7 @@ def session_snapshot(browser: str = "chrome") -> dict[str, Any]:
         "hasXsrfToken": state["hasXsrf"],
         "reason": state["reason"],
         "detail": state.get("detail", ""),
+        "transport": state.get("transport", ""),
         "action": state.get("action", ""),
     }
 
@@ -126,7 +129,8 @@ def run_step(command: list[str], log_path: Path) -> tuple[int, str]:
     return completed.returncode, output
 
 
-def run_account(account: dict[str, Any], output_root: Path, browser: str = "chrome") -> dict[str, Any]:
+def run_account(account: dict[str, Any], output_root: Path, browser: str = "auto",
+                transport: str = "auto", bridge_url: str = "") -> dict[str, Any]:
     name = account["shop"]
     prefix = safe_prefix(name)
     account_dir = (output_root / prefix).resolve()
@@ -150,6 +154,10 @@ def run_account(account: dict[str, Any], output_root: Path, browser: str = "chro
         "--output-dir", str(account_dir),
         "--browser", browser,
     ]
+    if transport != "auto":
+        command.extend(["--transport", transport])
+    if bridge_url:
+        command.extend(["--bridge-url", bridge_url])
     code, output = run_step(command, logs / "export.log")
     result["stages"]["export"] = {
         "ok": code == EXIT_OK,
@@ -198,8 +206,12 @@ def parse_args() -> argparse.Namespace:
                    metavar="店名,账号,支付开始,支付结束[,账号提示]",
                    help="直接在命令行给出一个账户；可重复，顺序即执行顺序")
     p.add_argument("--output-root", type=Path, help="多账户输出根目录，每个账户一个子目录")
-    p.add_argument("--browser", default="chrome",
-                   help="读取哪个浏览器的 cookie；会透传给 fine_export.py（默认 chrome）")
+    p.add_argument("--browser", default="auto",
+                   help="读哪个浏览器的 cookie 库；会透传给 fine_export.py（默认 auto）")
+    p.add_argument("--transport", default="auto", choices=["auto", "cookie", "bridge"],
+                   help="登录态来源：auto=cookie 库优先、失败自动回退浏览器桥（默认）")
+    p.add_argument("--bridge-url", default="",
+                   help="浏览器桥地址，默认 http://127.0.0.1:8899（脚本会自动起桥）")
     p.add_argument("--only", action="append", default=[], help="只跑指定店铺（可重复），按清单顺序")
     p.add_argument("--skip-completed", action="store_true", help="跳过批次状态里已完成的账户")
     p.add_argument("--skip-login-check", action="store_true", help="跳过登录态校验（仅调试用）")
@@ -220,7 +232,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     if args.check_login:
-        snapshot = session_snapshot(args.browser)
+        snapshot = session_snapshot(args.browser, args.transport, args.bridge_url or None)
         print(json.dumps({
             "loggedIn": snapshot.get("loggedIn"),
             "currentHint": snapshot.get("hint"),
@@ -228,6 +240,7 @@ def main() -> int:
             "hasXsrfToken": snapshot.get("hasXsrfToken"),
             "reason": snapshot.get("reason"),
             "detail": snapshot.get("detail", ""),
+            "transport": snapshot.get("transport", ""),
             "action": snapshot.get("action", ""),
             "loginUrl": "https://tgcwork.tmall.com/login",
         }, ensure_ascii=False, indent=2))
@@ -252,7 +265,7 @@ def main() -> int:
     for index, account in enumerate(selected, start=1):
         print(f"\n===== [{index}/{len(selected)}] {account['shop']}（{account['account'] or '账号未填'}）=====")
         if not args.skip_login_check:
-            snapshot = session_snapshot(args.browser)
+            snapshot = session_snapshot(args.browser, args.transport, args.bridge_url or None)
             hint = str(snapshot.get("hint") or "")
             if not snapshot.get("loggedIn"):
                 print(json.dumps({
@@ -299,7 +312,7 @@ def main() -> int:
             previous_hint = hint
             print(f"登录态校验通过：当前账号 {hint}")
 
-        result = run_account(account, output_root, args.browser)
+        result = run_account(account, output_root, args.browser, args.transport, args.bridge_url)
         state.setdefault("accounts", [])
         state["accounts"] = [item for item in state["accounts"] if item.get("shop") != account["shop"]]
         state["accounts"].append(result)

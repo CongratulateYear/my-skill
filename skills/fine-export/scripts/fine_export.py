@@ -49,14 +49,10 @@ FINE_HEADERS = [
 # 类型列：punish=违规记录归为「处罚数据」，compensation=赔付记录归为「赔付追缴」
 TAB_TYPE_LABELS = {"punish": "处罚数据", "compensation": "赔付追缴"}
 
-DEFAULT_SPREADSHEET_PYTHON = Path(
-    "/Users/rabbit/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3"
-)
+DEFAULT_SPREADSHEET_PYTHON = Path('C:\\Users\\Administrator\\.dsh\\dsh-runtimes\\dsh-primary-runtime\\dependencies\\python\\python.exe')
 # 常见的手工建库位置：codex 主运行时缺失时按序回退（与 asset-inventory 保持一致）。
 EXTRA_SPREADSHEET_PYTHONS = (
-    Path("/tmp/aivenv/bin/python"),
-    Path.home() / ".local/bin/python3.12",
-    Path.home() / ".local/bin/python3.13",
+    Path.home() / ".dsh" / "dsh-runtimes" / "dsh-primary-runtime" / "dependencies" / "python" / "python.exe",
 )
 WORKBOOK_WRITER = """
 import json, sys
@@ -242,22 +238,33 @@ def load_fetch_headers(path: Path) -> dict[str, str]:
     return headers
 
 
-def load_browser_headers(browser: str) -> dict[str, str]:
+def load_browser_headers(
+    transport: str = "auto", bridge_url: str | None = None, browser: str | None = None,
+) -> tuple[dict[str, str], Any, str]:
+    """复用本机浏览器已登录的天猫会话。
+
+    传输层由 tmall_session.build_session 决定：cookie 库优先，读不出来（Windows 的
+    v20 App Bound Encryption、或 Edge 运行中独占 Cookies 文件）时自动回退到
+    「借已登录标签页里的 fetch」的浏览器桥。
+    """
     import tmall_session
 
-    return tmall_session.build_headers(browser)
+    built = tmall_session.build_session(transport, browser, tmall_session.DEFAULT_DOMAIN, bridge_url)
+    return built["headers"], built["session"], built["transport"]
 
 
-def resolve_headers(args: argparse.Namespace) -> dict[str, str]:
-    if args.fetch_file is not None:
-        return load_fetch_headers(args.fetch_file.expanduser().resolve())
-    return load_browser_headers(args.browser)
+def resolve_headers(args: argparse.Namespace) -> tuple[dict[str, str], Any, str]:
+    """返回 (请求头, opener, 传输名)；--fetch-file 显式给的头优先，其余走浏览器。"""
+    if getattr(args, "fetch_file", None) is not None:
+        headers = load_fetch_headers(args.fetch_file.expanduser().resolve())
+        return headers, build_opener(), "fetch"
+    return load_browser_headers(args.transport, args.bridge_url or None, args.browser)
 
 
-def check_session(headers: dict[str, str]) -> bool:
+def check_session(headers: dict[str, str], session: Any = None) -> bool:
     import tmall_session
 
-    return tmall_session.check_session(headers)
+    return tmall_session.check_session(headers, session)
 
 
 def token_state(headers: dict[str, str]) -> dict[str, Any]:
@@ -537,8 +544,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="罚款明细输出目录，默认 ./outputs")
     p.add_argument("--fetch-file", type=Path,
                    help="可选：含 DevTools 复制的 fetch 的文本文件，只取其登录请求头；日期仍以命令行为准")
-    p.add_argument("--browser", default="chrome", choices=[*tmall_session.BROWSERS, "auto"],
-                   help="读取哪个浏览器的 cookie，默认 chrome")
+    p.add_argument("--browser", default="auto", choices=[*tmall_session.BROWSERS, "auto"],
+                   help="读哪个浏览器的 cookie 库（auto=Windows 上依次试 Edge/Chrome），"
+                        "被 v20 加密或文件独占挡住时自动回退浏览器桥")
+    p.add_argument("--transport", default="auto", choices=tmall_session.TRANSPORTS,
+                   help="登录态来源：auto=cookie 库优先、失败自动回退浏览器桥（默认）；"
+                        "cookie=只读浏览器 cookie 库；bridge=借已登录标签页里的 fetch")
+    p.add_argument("--bridge-url", default="",
+                   help="浏览器桥地址，默认 http://127.0.0.1:8899（脚本会自动起桥）")
     p.add_argument("--check-login", action="store_true",
                    help="只检查登录态与 token 并输出脱敏 JSON，不请求数据")
     p.add_argument("--dry-run", action="store_true",
@@ -578,7 +591,9 @@ def run_check_login(args: argparse.Namespace) -> int:
         }, ensure_ascii=False, indent=2))
         return EXIT_OK if ok and state["hasXsrfToken"] else EXIT_NEED_LOGIN
 
-    probed = ensure_login.probe(args.browser, tmall_session.DEFAULT_DOMAIN)
+    probed = ensure_login.probe(
+        args.browser, tmall_session.DEFAULT_DOMAIN, args.transport, args.bridge_url or None,
+    )
     print(json.dumps({
         "loggedIn": probed["loggedIn"],
         "reason": probed["reason"],
@@ -586,8 +601,9 @@ def run_check_login(args: argparse.Namespace) -> int:
         "account": probed["accountHint"],
         "cookieCount": probed["cookieCount"],
         "hasXsrfToken": probed["hasXsrf"],
+        "transport": probed.get("transport", ""),
         "action": probed["action"],
-        "source": f"browser:{args.browser}",
+        "source": f"browser:{probed.get('transport') or args.browser}",
         "loginUrl": ensure_login.LOGIN_URL,
     }, ensure_ascii=False, indent=2))
     return EXIT_OK if probed["loggedIn"] and probed["hasXsrf"] else EXIT_NEED_LOGIN
@@ -636,8 +652,8 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(dry_run_plan(args), ensure_ascii=False, indent=2))
         return EXIT_OK
 
-    headers = resolve_headers(args)
-    if not check_session(headers):
+    headers, session, transport = resolve_headers(args)
+    if not check_session(headers, session):
         raise AuthenticationError(
             "登录态校验失败：请在当前浏览器里打开 https://tgcwork.tmall.com/login 重新登录"
             "（复用已有标签，不要新开浏览器），或用 "
@@ -645,8 +661,10 @@ def main(argv: list[str] | None = None) -> int:
             "确认 loggedIn=true 后重试"
         )
     require_token(headers)
+    if transport == "bridge":
+        print("登录态来源：浏览器桥（借已登录标签页的 fetch，cookie 不经本进程明文重放）",
+              file=sys.stderr)
 
-    session = build_opener()
     start_ms, end_ms = epoch_ms(start, end=False), epoch_ms(end, end=True)
     request_headers = {**headers, "referer": RULES_CENTER_REFERER}
 
