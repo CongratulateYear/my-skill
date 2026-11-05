@@ -7,9 +7,9 @@
   淘工厂资产盘算导出罚款  --mode export --module 罚款   登录验证 → 仅导出罚款（处罚数据）
 
 依赖（安装本 skill 时必须一并安装，缺一不可）：
-  淘工厂登录 C:\\Users\\Administrator\\.dsh\\skills/淘工厂登录/
-  淘工厂导出 C:\\Users\\Administrator\\.dsh\\skills/淘工厂导出/
-  淘工厂合并 C:\\Users\\Administrator\\.dsh\\skills/淘工厂合并/
+  淘工厂登录 <skills-root>/淘工厂登录/
+  淘工厂导出 <skills-root>/淘工厂导出/
+  淘工厂合并 <skills-root>/淘工厂合并/
 脚本启动时逐一自检，缺哪个就报清单并退出。
 
 多公司：本脚本一次只处理一家公司。多公司由上层按用户给定顺序逐家调用，
@@ -21,15 +21,29 @@
 from __future__ import annotations
 
 import json
+import re
+from datetime import date
 import subprocess
 import sys
 from pathlib import Path
 
-SKILLS_ROOT = Path("C:\\Users\\Administrator\\.dsh\\skills")
+SKILLS_ROOT = Path(__file__).resolve().parents[2]
+
+
+def resolve_skill_script(chinese: str, english: str, script: str) -> Path:
+    roots = (SKILLS_ROOT, Path.home() / ".agents" / "skills", Path.home() / ".dsh" / "skills")
+    for root in roots:
+        for name in (chinese, english):
+            candidate = root / name / "scripts" / script
+            if candidate.is_file():
+                return candidate
+    return SKILLS_ROOT / chinese / "scripts" / script
+
+
 DEPENDENCIES = [
-    ("淘工厂登录", SKILLS_ROOT / "淘工厂登录" / "scripts" / "ensure_login.py"),
-    ("淘工厂导出", SKILLS_ROOT / "淘工厂导出" / "scripts" / "taogongchang_export.py"),
-    ("淘工厂合并", SKILLS_ROOT / "淘工厂合并" / "scripts" / "merge_excel.py"),
+    ("淘工厂登录", resolve_skill_script("淘工厂登录", "taogongchang-login", "ensure_login.py")),
+    ("淘工厂导出", resolve_skill_script("淘工厂导出", "taogongchang-export", "taogongchang_export.py")),
+    ("淘工厂合并", resolve_skill_script("淘工厂合并", "taogongchang-merge", "merge_excel.py")),
 ]
 EXPORT_ROOT_DEFAULT = Path("~/Downloads/淘工厂导出").expanduser()
 ALL_MODULE_WORDS = {"all", "全部", ""}
@@ -98,10 +112,50 @@ def main() -> int:
     p.add_argument("--export-root", type=Path, default=EXPORT_ROOT_DEFAULT,
                    help="淘工厂导出输出根目录（默认 ~/Downloads/淘工厂导出）")
     p.add_argument("--fetch-file", type=Path,
-                   help="用户贴的 queryBillDetail fetch 文本文件；提供后跳过登录闸门")
+                   help="用户贴的 queryBillDetail fetch；跳过本机闸门，导出内核仍校验该会话公司")
     p.add_argument("--login-wait", type=float, default=10.0,
                    help="登录闸门等待 cookie 落库的秒数（默认 10）")
+    p.add_argument("--expect-account", help="仅用户明确要求核对特定账号时提供；不得自动填登录手机号")
+    p.add_argument("--strict-account", action="store_true",
+                   help="显式严格账号核对；公司匹配也阻断可比账号不符，须同时给 --expect-account")
+    p.add_argument("--resume", action="store_true", help="从公司目录状态文件续跑")
+    p.add_argument("--browser", default="auto")
+    p.add_argument("--transport", choices=["auto", "cookie", "bridge"], default="auto")
+    p.add_argument("--bridge-url")
+    p.add_argument("--batch-folder", type=Path, help="多公司共用的批次总目录；各公司仍严格串行")
+    p.add_argument("--output-dir", type=Path, help="显式覆盖合并输出目录；默认与公司导出文件夹并列（导出根或批次总目录）")
+    p.add_argument("--dry-run", action="store_true", help="离线显示执行命令，不登录、不导出、不写文件")
     args = p.parse_args()
+    if args.strict_account and not (args.expect_account or "").strip():
+        p.error("--strict-account requires --expect-account")
+    if not args.company_name.strip():
+        p.error("--company-name 不能为空")
+    # Validate supplied dates before login, network requests, or directory writes.
+    for prefix in ("order_pay", "write_off"):
+        start, end = (getattr(args, prefix + suffix) for suffix in ("_start", "_end"))
+        if bool(start) != bool(end):
+            p.error(f"{prefix} 的开始和结束日期必须同时提供")
+        if start:
+            try:
+                if not all(re.fullmatch(r"\d{4}-\d{2}-\d{2}", value) for value in (start, end)):
+                    raise ValueError("日期格式须为 YYYY-MM-DD")
+                if date.fromisoformat(start) > date.fromisoformat(end):
+                    raise ValueError("开始日期不能晚于结束日期")
+            except ValueError as exc:
+                p.error(f"{prefix} 日期无效：{exc}")
+    if args.settlement_date:
+        parts = re.split(r"[~_]", args.settlement_date.strip())
+        try:
+            if len(parts) not in (1, 2) or not all(re.fullmatch(r"\d{4}-\d{2}-\d{2}", value) for value in parts):
+                raise ValueError("须为 YYYY-MM-DD 或 YYYY-MM-DD_YYYY-MM-DD")
+            parsed = [date.fromisoformat(value) for value in parts]
+            if len(parsed) == 2 and parsed[0] > parsed[1]:
+                raise ValueError("开始日期不能晚于结束日期")
+        except ValueError as exc:
+            p.error(f"--settlement-date 无效：{exc}")
+    args.export_root = args.export_root.expanduser().resolve()
+    if args.batch_folder:
+        args.batch_folder = args.batch_folder.expanduser().resolve()
 
     check_dependencies()
     ensure_login, export_script, merge_script = (str(script) for _, script in DEPENDENCIES)
@@ -110,9 +164,16 @@ def main() -> int:
 
     # 1) 登录闸门：先确认当前浏览器登录的正是目标公司（ensure_login 自带
     #    cookie 库 → 浏览器桥回退；失败时其 JSON 里的 action 指引会原样转达）
-    if args.fetch_file is None:
+    transport_args = ["--browser", args.browser, "--transport", args.transport]
+    if args.bridge_url:
+        transport_args += ["--bridge-url", args.bridge_url]
+    if args.fetch_file is None and not args.dry_run:
         gate_cmd = [sys.executable, ensure_login, "--expect-company", args.company_name,
-                    "--wait", str(max(args.login_wait, 0.0))]
+                    "--wait", str(max(args.login_wait, 0.0)), *transport_args]
+        if args.expect_account:
+            gate_cmd += ["--expect-account", args.expect_account]
+        if args.strict_account:
+            gate_cmd.append("--strict-account")
         rc, state = run_gate(gate_cmd)
         if rc == 3:
             reason = state.get("reason", "未知原因")
@@ -139,7 +200,17 @@ def main() -> int:
             export_cmd += [f"--{key.replace('_', '-')}", value]
     if args.fetch_file:
         export_cmd += ["--fetch-file", str(args.fetch_file)]
-    rc = run(export_cmd)
+    export_cmd += transport_args
+    if args.batch_folder:
+        export_cmd += ["--batch-folder", str(args.batch_folder)]
+    if args.resume:
+        export_cmd.append("--resume")
+    if args.dry_run:
+        print("DRY RUN: 登录闸门以公司为准；指定账号默认仅诊断，--strict-account 才阻断账号不符。")
+        print("+", " ".join(export_cmd), flush=True)
+        rc = 0
+    else:
+        rc = run(export_cmd)
     if rc != 0:
         print(f"淘工厂导出失败（exit {rc}）；已成功流程的文件保留在导出文件夹，"
               f"可加 --resume 续跑", file=sys.stderr)
@@ -158,10 +229,25 @@ def main() -> int:
             sys.executable, merge_script,
             "--company-name", args.company_name,
             "--export-root", str(args.export_root),
+            "--strict",
         ]
         if settlement:
             merge_cmd += ["--settlement-date", settlement]
-        rc = run(merge_cmd)
+        # 始终显式定位本次导出的公司目录，避免自定义结算标签导致匹配错目录。
+        # 合并默认输出到该目录的父目录，主表与原始导出目录并列；不增加公司包装层。
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("tgc_export_layout", export_script)
+        layout = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(layout)
+        company_folder = layout.build_folder(args.batch_folder or args.export_root, args.company_name, args)
+        merge_cmd += ["--export-folder", str(company_folder)]
+        if args.output_dir:
+            merge_cmd += ["--output-dir", str(args.output_dir.expanduser().resolve())]
+        if args.dry_run:
+            print("+", " ".join(merge_cmd), flush=True)
+            rc = 0
+        else:
+            rc = run(merge_cmd)
         if rc != 0:
             print(f"淘工厂合并失败（exit {rc}）", file=sys.stderr)
             return rc

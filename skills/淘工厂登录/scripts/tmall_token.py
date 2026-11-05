@@ -58,7 +58,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="auto=cookie 库优先、失败回退浏览器桥；cookie=只读 cookie 库；bridge=只用页面桥")
     parser.add_argument("--bridge-url", default="", help="桥地址，默认 http://127.0.0.1:8899")
     parser.add_argument("--expect-account", default="",
-                        help="期望登录的账号（手机号或账号提示）；不一致时输出 wrong-account 并退出 3")
+                        help="账号提示；公司匹配时默认仅诊断，不作为登录身份约束")
+    parser.add_argument("--strict-account", action="store_true",
+                        help="显式严格账号核对：可比账号不匹配仍报 wrong-account；须同时给 --expect-account")
     parser.add_argument("--expect-company", default="",
                         help="期望的公司/店铺名（通常为简称，如「埔鸣」）；"
                              "不匹配时输出 wrong-company 并退出 3")
@@ -68,12 +70,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--with-headers", action="store_true",
                         help="JSON 里附带完整请求头（含 cookie，仅限调用方内存中使用）")
     args = parser.parse_args(argv)
+    if args.strict_account and not args.expect_account.strip():
+        parser.error("--strict-account requires --expect-account")
 
     started = time.monotonic()
     expected = args.expect_account.strip()
     expected_company = args.expect_company.strip()
     company_seen: list[str] = []  # stash from fetch() so we do not hit the API twice
     note_seen: list[str] = []
+    account_seen: list[str] = []
 
     def fetch() -> tuple[bool, str, dict, Any]:
         try:
@@ -89,20 +94,24 @@ def main(argv: list[str] | None = None) -> int:
         info: dict = {}
         if expected or expected_company:
             info = tmall_session.fetch_company(headers, built["session"])
-        if expected:
-            verdict = tmall_session.account_verdict(
-                expected, info.get("erpMobile", ""), tmall_session.account_hint(headers))
-            if verdict == "mismatch":
-                return False, "wrong-account", headers, built["session"]
-            if verdict == "unverified":
-                note_seen[:] = [
-                    f"账号未能核对（expected={expected}，erpMobile/hint 均不可比），未阻断"]
         if expected_company:
             company_seen[:] = [info.get("company", "")]
             if not info.get("company"):
                 return False, "company-unknown", headers, built["session"]
             if not tmall_session.company_matches(expected_company, info["company"]):
                 return False, "wrong-company", headers, built["session"]
+        if expected:
+            verdict = tmall_session.account_verdict(
+                expected, info.get("erpMobile", ""), tmall_session.account_hint(headers))
+            account_seen[:] = [verdict]
+            if verdict == "mismatch" and (args.strict_account or not expected_company):
+                return False, "wrong-account", headers, built["session"]
+            if verdict == "mismatch":
+                account_seen[:] = ["mismatch-ignored-company-match"]
+                note_seen[:] = ["公司匹配；登录手机号与 erpMobile 可不同，不阻断。"]
+            if verdict == "unverified":
+                note_seen[:] = [
+                    f"账号未能核对（expected={expected}，erpMobile/hint 均不可比），未阻断"]
         return True, "logged-in", headers, built["session"]
 
     try:
@@ -143,6 +152,8 @@ def main(argv: list[str] | None = None) -> int:
         "xsrfToken": headers.get("x-xsrf-token", ""),
         "waitedSeconds": round(time.monotonic() - started, 1),
     }
+    if account_seen:
+        payload["accountCheck"] = account_seen[0]
     if note_seen:
         payload["note"] = note_seen[0]
     if args.with_headers:

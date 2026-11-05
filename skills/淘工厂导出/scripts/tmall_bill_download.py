@@ -173,11 +173,18 @@ QUERY_PATH = "/ds/api/v1/fbi/bill/queryBillDetail"
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 PAN_SUAN_BUILDER = Path(__file__).resolve().with_name("pan_suan_builder.py")
 DEFAULT_PAN_SUAN_TEMPLATE = SKILL_ROOT / "assets" / "盘算模板.xlsx"
-DEFAULT_SPREADSHEET_PYTHON = Path('C:\\Users\\Administrator\\.dsh\\dsh-runtimes\\dsh-primary-runtime\\dependencies\\python\\python.exe')
-# Extra places an openpyxl-capable interpreter plausibly lives; the hardcoded
-# Codex runtime above only exists on machines that installed that bundle.
+DEFAULT_SPREADSHEET_PYTHON = (
+    Path.home() / ".dsh" / "dsh-runtimes" / "dsh-primary-runtime" / "dependencies" / "python" / "python.exe"
+)
+# Cross-platform candidate Python interpreters with openpyxl installed (Windows + macOS).
 EXTRA_SPREADSHEET_PYTHONS = (
+    Path("/tmp/aivenv/bin/python"),
+    Path("/tmp/tgexport-venv/bin/python"),
+    Path.home() / ".local" / "bin" / "python3.12",
     Path.home() / ".dsh" / "dsh-runtimes" / "dsh-primary-runtime" / "dependencies" / "python" / "python.exe",
+    Path("/Applications/Codex.app/Contents/Resources/dsh-runtime/dependencies/python/bin/python3"),
+    Path.home() / ".codex" / "dsh-runtimes" / "dsh-primary-runtime" / "dependencies" / "python" / "bin" / "python3",
+    Path.home() / ".codex" / "dsh-runtimes" / "dsh-primary-runtime" / "dependencies" / "python" / "python.exe",
 )
 
 
@@ -191,6 +198,7 @@ def parse_args() -> argparse.Namespace:
         "--skip-module", choices=list(MODULES), action="append", default=[],
         help="跳过已确认完成的模块，可重复；用于旧运行结果的手工续跑",
     )
+    p.add_argument("--expect-company", help="目标公司原文；导出门面必传。独立旧调用省略时不提供公司身份保证")
     p.add_argument("--resume", action="store_true", help="读取无凭据状态文件并跳过其中已完成的模块")
     p.add_argument("--state-file", type=Path, help="续跑状态文件；默认与盘算输出同目录同前缀")
     p.add_argument(
@@ -364,7 +372,7 @@ def load_browser_headers(
             "`python scripts/browser_bridge.py --port 8899` 并用 magpie-browser 的 evaluate "
             "在已登录的 tgc.tmall.com 标签里执行 scripts/bridge_agent.js；"
             "如果浏览器本身没登录，用 magpie-browser 在当前已打开的浏览器里打开 "
-            "https://tgcwork.tmall.com/login 完成登录（复用已有标签，不要新开浏览器），"
+            "https://tgcwork.tmall.com/login 完成登录（新开 Magpie 标签页，不要新开浏览器），"
             "然后重跑本命令。" + (f"（诊断：{str(exc).splitlines()[0]}）" if str(exc) else "")
         ) from exc
     headers, session = built["headers"], built["session"]
@@ -372,9 +380,39 @@ def load_browser_headers(
         raise ValueError(
             "天猫登录态已失效。先运行 `python3 scripts/ensure_login.py` 确认状态，再用 "
             "magpie-browser 在当前已打开的浏览器里打开 https://tgcwork.tmall.com/login "
-            "重新登录（复用已有标签，不要新开浏览器），然后重跑本命令。"
+            "重新登录（新开 Magpie 标签页，不要新开浏览器），然后重跑本命令。"
         )
     return headers, session
+
+
+def validate_company(expected: str | None, headers: dict[str, str], session: Any) -> None:
+    """Check the exact execution transport; never substitute a phone identity."""
+    if expected is None:  # Legacy standalone downloader without a target identity.
+        return
+    import tmall_session
+    try:
+        identity = tmall_session.fetch_company(headers, session)
+    except Exception as exc:
+        raise ValueError("company-unknown：无法确认目标公司") from exc
+    if not identity.get("ok") or not str(identity.get("company") or "").strip():
+        raise ValueError("company-unknown：无法确认目标公司")
+    if not tmall_session.company_matches(expected, identity["company"]):
+        raise ValueError("wrong-company：当前会话不属于目标公司")
+
+
+def publication_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Explicit zero/completed manifest: paths only, never download URLs."""
+    result = dict(result)
+    if result.get("noData") is True:
+        result.update(status="zero", publishFiles=[])
+        return result
+    directory = result.get("outputDir")
+    files = sorted(p.resolve() for p in Path(directory).rglob("*")
+                   if p.is_file() and not p.is_symlink() and p.suffix.lower() == ".xlsx") if directory else []
+    if not files:
+        raise RuntimeError("完成流程缺少 XLSX，拒绝将缺文件推断为零数据")
+    result.update(status="completed", publishFiles=[str(p) for p in files])
+    return result
 
 
 def validate_runtime_options(args: argparse.Namespace) -> None:
@@ -773,16 +811,20 @@ def find_spreadsheet_python() -> Path:
     ])
     checked: set[Path] = set()
     for candidate in candidates:
-        candidate = candidate.resolve()
-        if candidate in checked or not candidate.exists():
+        # 不解引用 venv 的 python 符号链接，否则会丢失虚拟环境依赖。
+        candidate = candidate.expanduser().absolute()
+        if candidate in checked or not candidate.is_file():
             continue
         checked.add(candidate)
-        probe = subprocess.run(
-            [str(candidate), "-c", "import openpyxl"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
+        try:
+            probe = subprocess.run(
+                [str(candidate), "-c", "import openpyxl"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False, timeout=15,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
         if probe.returncode == 0:
             return candidate
     raise RuntimeError(
@@ -1548,11 +1590,6 @@ def main() -> int:
     if args.dry_run:
         print(json.dumps(dry_run_plan(args, query_url, body, module_keys, pan_output, state_file), ensure_ascii=False, indent=2))
         return 0
-    if not module_keys:
-        print("没有待执行模块：所选流程均已完成或被 --skip-module 跳过。")
-        print(f"盘算文件：{pan_output}")
-        return 0
-
     # Validate every module's date payload before making the first network request.
     dates_by_module = {key: module_date_filters(args, body, MODULES[key]) for key in module_keys}
     if query_request:
@@ -1562,10 +1599,13 @@ def main() -> int:
         session = build_opener()
     else:
         base_headers, session = load_browser_headers(args.transport, args.bridge_url or None, args.browser)
+    validate_company(args.expect_company if args.expect_company is not None else args.shop_name,
+                     base_headers, session)
     multi = args.module == "all" or len(module_keys) > 1
     state_dates = {key: common_dates[key] for key in ("writeOffTime", "orderPayTime") if key in common_dates}
     state = {
-        "version": 1,
+        "version": 2,
+        "scope": args.module,
         "shopName": args.shop_name,
         "dates": state_dates,
         "panSuanOutput": str(pan_output),
@@ -1574,6 +1614,8 @@ def main() -> int:
         "results": dict(resume_state.get("results", {})) if isinstance(resume_state.get("results", {}), dict) else {},
     }
 
+    save_state(state_file, state)
+
     def run_one(module_key: str, is_last: bool) -> dict[str, Any]:
         try:
             result = execute_module(
@@ -1581,6 +1623,8 @@ def main() -> int:
                 # Do not open/re-save with a spreadsheet engine after completion.
                 recalculate=False, multi=multi,
             )
+            if args.no_pan_suan:
+                result = publication_result(result)
         except Exception as exc:
             state["failedModule"] = module_key
             state["failure"] = safe_summary(str(exc))

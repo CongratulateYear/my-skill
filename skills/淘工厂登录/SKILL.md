@@ -1,6 +1,6 @@
 ---
 name: taogongchang-login
-description: 淘工厂（tgcwork/tgc.tmall.com）登录与 token 获取：默认直接复用本机浏览器已登录的天猫会话（只读本机 cookie 库，无需浏览器在线），cookie 库读不到时（v20 应用绑定加密 / Edge 独占锁定 / 沙箱拦临时区）自动回退浏览器桥（后台起内置 browser_bridge.py + magpie 在已登录的 tgc 标签页注入 agent，同样不新开浏览器）；登录态失效时用 magpie-browser 在当前已经打开的浏览器里自动登录（先判断 magpie-browser 是否可用，不可用给出提示；绝不新开浏览器/新 profile，一律在新开的 Magpie 标签页里操作、不复用已有标签页；不落盘密码）；支持公司名校验（用户发来公司名称时用 --expect-company 验证登录账号是否属于该公司，不匹配报 wrong-company）；支持账号校验（--expect-account；手机号走 accountInfo 的 erpMobile 脱敏比对，不再与 cookie 提示混淆）；登录失败分类处理（滑块验证提示用户滑动、账号密码错误提示用户、账号失效提示用户）；获取的 cookie/XSRF token/完整请求头可供其他 skill 以子进程 JSON 或 import tmall_session 两种方式在内存中引用，绝不落盘。跨平台：macOS+Chrome（钥匙串 AES-CBC）与 Windows+Edge（DPAPI AES-GCM，v20 及锁库场景走桥）。当用户说「登录淘工厂/天猫」「获取天猫 token」「拿一下 XSRF」「检查天猫登录态」，或其他 skill 调天猫接口前需要登录态/token 时使用。
+description: 淘工厂（tgcwork/tgc.tmall.com）登录与 token 获取：默认直接复用本机浏览器已登录的天猫会话（只读本机 cookie 库，无需浏览器在线），cookie 库读不到时（v20 应用绑定加密 / Edge 独占锁定 / 沙箱拦临时区）自动回退浏览器桥（后台起内置 browser_bridge.py + magpie 在已登录的 tgc 标签页注入 agent，同样不新开浏览器）；登录态失效时用 magpie-browser 在当前已经打开的浏览器里自动登录（先判断 magpie-browser 是否可用，不可用给出提示；绝不新开浏览器/新 profile，一律在新开的 Magpie 标签页里操作、不复用已有标签页；不落盘密码）；支持公司名校验（用户发来公司名称时用 --expect-company 验证登录账号是否属于该公司，不匹配报 wrong-company）；公司优先：同公司多个登录手机号不因 erpMobile 不同阻断；--expect-account 默认诊断，--strict-account 显式严格核对；登录失败分类处理（滑块验证提示用户滑动、账号密码错误提示用户、账号失效提示用户）；获取的 cookie/XSRF token/完整请求头可供其他 skill 以子进程 JSON 或 import tmall_session 两种方式在内存中引用，绝不落盘。跨平台：macOS+Chrome（钥匙串 AES-CBC）与 Windows+Edge（DPAPI AES-GCM，v20 及锁库场景走桥）。当用户说「登录淘工厂/天猫」「获取天猫 token」「拿一下 XSRF」「检查天猫登录态」，或其他 skill 调天猫接口前需要登录态/token 时使用。
 ---
 
 # 淘工厂登录（淘工厂登录与 token 获取）
@@ -48,10 +48,22 @@ python3 <skill目录>/scripts/ensure_login.py
 python3 <skill目录>/scripts/ensure_login.py --expect-company 埔鸣
 ```
 
-公司不匹配 → `wrong-company`（当前浏览器登录的是别家公司的账号，要退出换号）；接口查询失败 → `company-unknown`（重跑一次，仍失败就人工核对）。需要确认特定账号时再加 `--expect-account <账号提示>`：
+**身份以公司名称为准，不以登录手机号为准**：同一公司可以有多个手机号登录；`erpMobile` 仅为平台返回的 ERP 绑定信息（手机号），不是当前实际登录手机号，不能用于认定实际登录身份。用户提供的登录手机号只用于需要登录时填表，**不得自动变成 `--expect-account` 身份约束**。
 
-- **手机号**（11 位数字）：只与 `accountInfo` 返回的 `erpMobile` 脱敏串比对（如期望 `13128826864` ↔ 实际 `1312****864`），不匹配 → `wrong-account`；接口没返回 `erpMobile` 时输出 `accountCheck: unverified`（不阻断，只提示人工核对）。手机号**不**再与 cookie 提示（`scm…` 一类）比较，避免不同类身份误报。
-- **非手机号**（scm 账号等）：与 cookie 提示（`accountHint`）比较，不匹配 → `wrong-account`；提示为空或对不上类型 → `unverified` 不阻断。
+- 公司先校验：不匹配 → `wrong-company`；公司名查不到 → `company-unknown`。即使手机号相同、或账号不可核对，也不得放行；保留原公司简称/全称匹配规则。
+- 默认只传 `--expect-company`。显式给了 `--expect-account` 且公司已匹配时，账号不匹配仅输出 `accountCheck: mismatch-ignored-company-match`，仍成功，不要求退出/换号。
+- 用户**明确要求严格核对特定账号**时，同时传 `--expect-account <账号提示> --strict-account`；可比账号不匹配 → `wrong-account`。仅给 `--strict-account` 不给账号是参数错误。
+- 没有 `--expect-company` 时，显式 `--expect-account` 保持原账号单独核对行为（可比不符即阻断）。
+- 严格/单独账号核对的比对来源不变：11 位手机号与 `accountInfo.erpMobile` 脱敏串比较；非手机号与 cookie `accountHint` 比较。缺失可比证据仍是 `unverified`，不将未知当作已确认匹配；公司校验绝不因此跳过。
+
+```bash
+# 常规：只按目标公司验证；不要自动附加用户登录手机号
+python3 <skill目录>/scripts/ensure_login.py --expect-company 埔鸣
+# 只有用户明确要求严格账号核对时
+python3 <skill目录>/scripts/ensure_login.py --expect-company 埔鸣 --expect-account <指定账号> --strict-account
+```
+
+`tmall_token.py` 使用完全相同的公司优先/显式严格账号策略与参数。
 
 ### 1b. cookie 库读不到时：起浏览器桥（`reason: no-session`）
 
@@ -69,7 +81,7 @@ Windows 上 Edge 正在运行会把 cookie 库锁死（`immutable` 直读也失�
    () => { const s = document.createElement('script'); s.src = 'http://127.0.0.1:8899/agent.js'; document.head.appendChild(s); return 'agent injected'; }
    ```
 
-   随后重跑 `ensure_login.py`，JSON 里 `transport: "bridge"`、`erpMobile` 有值即桥路生效。桥只监听 127.0.0.1，凭据内存流转不落盘。
+   随后重跑 `ensure_login.py`，JSON 里 `transport: "bridge"` 且登录态有效即桥路生效（有目标公司时必须公司匹配，不要求 `erpMobile` 有值）。桥只监听 127.0.0.1，凭据内存流转不落盘。
 
 ### 2. 登录动作（仅退出码 3 时）
 
@@ -131,7 +143,7 @@ python3 <skill目录>/scripts/tmall_token.py --with-headers --expect-company 埔
    python3 <skill目录>/scripts/tmall_token.py --with-headers
    ```
 
-   stdout 输出一个 JSON：`ok` / `reason` / `accountHint` / `company` / `cookieCount` / `xsrfToken` / `headers`（含 `cookie`、`x-xsrf-token`、`user-agent`、`referer`、`origin`、`content-type`）。调用方解析后直接发请求；退出码 3 表示先要走上面的登录流程。注意输出较大，**先重定向到临时变量/临时文件再解析，不要直接接 heredoc（会 broken pipe）**；临时文件用完即删。
+   stdout 输出一个 JSON：`ok` / `reason` / `accountHint` / `company` / `cookieCount` / `xsrfToken` / `headers`（含 `cookie`、`x-xsrf-token`、`user-agent`、`referer`、`origin`、`content-type`）。调用方解析后直接发请求；退出码 3 表示先要走上面的登录流程。调用方使用 `subprocess.run(..., capture_output=True)` 在内存中解析 stdout，禁止将输出重定向到文件、日志或聊天。不要把凭据 JSON 直接接入占用 stdin 的 heredoc；不要在终端工具中直接展示 `--with-headers` 的输出。
 
 2. **import 方式（同 Python 进程）**：
 
@@ -145,7 +157,7 @@ python3 <skill目录>/scripts/tmall_token.py --with-headers --expect-company 埔
    hint = tmall_session.account_hint(headers)     # 账号提示（脱敏）
    info = tmall_session.fetch_company(headers, session) # {"company": 全称, "erpMobile": 脱敏手机号, "ok": bool, "detail": str}
    tmall_session.company_matches("埔鸣", info["company"])  # 公司名匹配（简称↔全称）
-   tmall_session.account_verdict("13128826864", info["erpMobile"], hint)  # "ok" / "mismatch" / "unverified"
+   tmall_session.account_verdict("13128826864", info["erpMobile"], hint)  # 仅账号证据，不代替公司校验；公司匹配默认不据此阻断
    ```
 
 **红线**：`headers` / `xsrfToken` / cookie 只在调用方进程内存里用，不写入任何文件、日志、状态或聊天回复；需要展示时只给 `accountHint`、`company`、`cookieCount` 这类脱敏字段。
@@ -162,7 +174,7 @@ python3 <skill目录>/scripts/tmall_token.py --with-headers --expect-company 埔
 - Python 3.11+，`cryptography`（AES-GCM/CBC 解密）。
 - macOS 无需额外依赖（`security` 命令读钥匙串）；Windows 无需 pywin32（ctypes 调 crypt32）。
 - 浏览器桥自包含：`scripts/browser_bridge.py` + `scripts/bridge_agent.js` 随本 skill 附带（纯标准库），不依赖任何其他 skill。
-- 若系统 `python3` 缺 `cryptography`：`uv venv /tmp/tmlogin-venv --python 3.12 && uv pip install --python /tmp/tmlogin-venv/bin/python cryptography`，之后用 `/tmp/tmlogin-venv/bin/python` 运行脚本。
+- 优先使用当前带依赖的 Python。macOS 可用 `python3`；Windows 可用 `py -3` 或 DSH 自带 Python（基于当前用户路径，不限定 Administrator）。缺 `cryptography` 时用 `uv venv .venv --python 3.12` 建环境；macOS 安装：`uv pip install --python .venv/bin/python cryptography`，Windows 安装：`uv pip install --python .venv/Scripts/python.exe cryptography`，之后用对应解释器运行脚本。不要跨平台复制二进制依赖。
 - magpie-browser MCP（登录动作与 agent 注入用；纯检查/取 token 且 cookie 库可读时不需要浏览器在线）。
 
 ## 已知限制
@@ -177,8 +189,8 @@ python3 <skill目录>/scripts/tmall_token.py --with-headers --expect-company 埔
 
 | 脚本 | 作用 |
 |---|---|
-| `scripts/ensure_login.py` | 登录态闸门（唯一判据来源，含 `--wait` / `--expect-account` / `--expect-company` / `--transport` / `--bridge-url`） |
-| `scripts/tmall_token.py` | 获取 XSRF token / 完整请求头（含 `--with-headers` / `--expect-company` / `--transport` / `--bridge-url`） |
+| `scripts/ensure_login.py` | 登录态闸门（唯一判据来源，含 `--wait` / `--expect-account` / `--strict-account` / `--expect-company` / `--transport` / `--bridge-url`） |
+| `scripts/tmall_token.py` | 获取 XSRF token / 完整请求头（含 `--with-headers` / `--expect-account` / `--strict-account` / `--expect-company` / `--transport` / `--bridge-url`） |
 | `scripts/tmall_session.py` | 跨平台 cookie 解密与会话构建（macOS 钥匙串 / Windows DPAPI；`build_session` 支持 cookie→桥自动回退），供其他 skill import |
 | `scripts/browser_bridge.py` | 浏览器桥服务（127.0.0.1:8899，纯标准库，配合 magpie 注入 agent 使用） |
 | `scripts/bridge_agent.js` | 注入到已登录 tgc 标签页的桥 agent（由 browser_bridge.py 托管在 `/agent.js`） |

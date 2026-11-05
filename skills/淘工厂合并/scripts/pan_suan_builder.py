@@ -34,8 +34,8 @@ try:
     from openpyxl.worksheet.table import Table, TableStyleInfo
 except ImportError as exc:  # pragma: no cover - environment issue
     raise SystemExit(
-        "缺少 openpyxl。请使用带 openpyxl 的 Python 运行此脚本，例如："
-        r"C:\Users\Administrator\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe"
+        "缺少 openpyxl。请使用带 openpyxl 的 Python 运行此脚本（如 /tmp/aivenv/bin/python、"
+        "~/.local/bin/python3.12 或 ~/.dsh/dsh-runtimes/dsh-primary-runtime/dependencies/python/python.exe）。"
     ) from exc
 
 TARGET_ALIASES = OrderedDict([
@@ -134,6 +134,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--template", type=Path, required=True, help="盘算模板或现有盘算文件")
     p.add_argument("--input", type=Path, action="append", default=[], help="账单明细文件或目录，可重复")
     p.add_argument("--output", type=Path, required=True, help="输出盘算文件")
+    p.add_argument("--accumulate", action="store_true", help="保留模板中已有明细，与新明细按完整行去重追加")
     p.add_argument("--strict", action="store_true", help="遇到无法识别的xlsx时失败，而不是跳过")
     p.add_argument(
         "--expected-target", choices=list(dict.fromkeys(TARGET_ALIASES.values())),
@@ -206,6 +207,8 @@ def collect_xlsx(inputs: Iterable[Path]) -> list[Path]:
     seen: set[Path] = set()
     for raw in inputs:
         path = raw.expanduser().resolve()
+        if not path.exists():
+            raise FileNotFoundError(f"来源路径不存在：{path}")
         candidates = [path] if path.is_file() else sorted(path.rglob("*.xlsx")) if path.is_dir() else []
         for item in candidates:
             if item.name.startswith("~$"):
@@ -231,7 +234,8 @@ def load_input_workbook(path: Path, data_only: bool):
     """
     wb = load_workbook(path, read_only=True, data_only=data_only)
     ws = wb[wb.sheetnames[0]]
-    if ws.max_row <= 1 and ws.max_column <= 1:
+    if (ws.max_row is None or ws.max_column is None
+            or (ws.max_row <= 1 and ws.max_column <= 1)):
         wb.close()
         wb = load_workbook(path, read_only=False, data_only=data_only)
     return wb
@@ -244,11 +248,9 @@ def detect_target(path: Path, wb=None) -> str | None:
             return target
     opened = False
     if wb is None:
-        try:
-            wb = load_input_workbook(path, data_only=False)
-            opened = True
-        except Exception:
-            return None
+        # Read/ZIP/XML failures are source errors, not an unknown bill type.
+        wb = load_input_workbook(path, data_only=False)
+        opened = True
     try:
         if "公司汇总" in wb.sheetnames:
             return None
@@ -785,6 +787,7 @@ def merge(
     expected_target: str | None = None,
     allow_empty_target: bool = False,
     shop_name: str | None = None,
+    accumulate: bool = False,
 ) -> dict[str, Any]:
     template = template.expanduser().resolve()
     output = output.expanduser().resolve()
@@ -800,35 +803,46 @@ def merge(
 
     grouped: dict[str, list[tuple[Path, list[list[Any]]]]] = defaultdict(list)
     skipped: list[str] = []
-    for path in collect_xlsx(inputs):
-        if path == template or path == output:
-            continue
-        try:
-            target = expected_target or detect_target(path)
-            if not target or target not in wb.sheetnames:
-                if strict:
-                    raise ValueError(f"无法识别账单类型：{path}")
-                skipped.append(str(path))
-                continue
-            target_headers = [str(wb[target].cell(1, c).value or "") for c in range(1, wb[target].max_column + 1)]
-            rows, _ = read_bill_rows(path, target_headers)
-            grouped[target].append((path, rows))
-        except Exception:
+    source_paths = [path for path in collect_xlsx(inputs) if path not in (template, output)]
+    for path in source_paths:
+        target = expected_target or detect_target(path)
+        if not target:
             if strict:
-                raise
+                raise ValueError(f"无法识别账单类型：{path}")
             skipped.append(str(path))
+            continue
+        if target not in wb.sheetnames:
+            raise ValueError(f"模板缺少已识别目标Sheet：{target}")
+        target_headers = [str(wb[target].cell(1, c).value or "") for c in range(1, wb[target].max_column + 1)]
+        # Once a type is known, header/read errors must abort before publishing.
+        rows, _ = read_bill_rows(path, target_headers)
+        grouped[target].append((path, rows))
 
     if expected_target and expected_target not in grouped:
-        if allow_empty_target:
+        if allow_empty_target and not source_paths:
+            if expected_target not in wb.sheetnames:
+                raise ValueError(f"模板缺少预期Sheet：{expected_target}")
             grouped[expected_target] = []
         else:
             raise ValueError(f"下载明细未能写入预期Sheet：{expected_target}")
+    if not grouped:
+        raise ValueError("没有成功读取的来源账单，拒绝生成或替换输出")
 
     import_stats: list[dict[str, Any]] = []
     for target, parts in grouped.items():
         ws = wb[target]
         headers = [str(ws.cell(1, c).value or "") for c in range(1, ws.max_column + 1)]
         combined: list[list[Any]] = []
+        if accumulate and parts:
+            # Only rows with actual values are history; styled blank rows are not.
+            for raw in ws.iter_rows(min_row=2, max_col=len(headers), values_only=True):
+                if not any(v is not None and str(v).strip() for v in raw):
+                    continue
+                combined.append([
+                    identifier_text(value) if any(word in header for word in IDENTIFIER_WORDS) else value
+                    for header, value in zip(headers, raw)
+                ])
+        existing_rows = len(combined)
         for _, rows in parts:
             combined.extend(rows)
         deduped, duplicate_count = dedupe_rows(combined, headers)
@@ -863,7 +877,8 @@ def merge(
         import_stats.append({
             "target": target,
             "source": "；".join(str(p) for p, _ in parts),
-            "read_rows": len(combined),
+            "read_rows": len(combined) - existing_rows,
+            "existing_rows": existing_rows,
             "written_rows": len(deduped),
             "duplicates": duplicate_count,
             "amount_header": amount_header,
@@ -1006,7 +1021,7 @@ def main() -> int:
     ) if args.result_json is not None else None
     result = merge(
         args.template, args.input, args.output, args.strict, args.recalculate and not args.no_recalculate,
-        args.expected_target, args.allow_empty_target, args.shop_name,
+        args.expected_target, args.allow_empty_target, args.shop_name, args.accumulate,
     )
     if result_path is not None:
         write_result_json(result_path, result)

@@ -35,6 +35,10 @@ def ensure_vendor_path() -> list[Path]:
         if text not in sys.path:
             sys.path.insert(0, text)
             added.append(directory)
+        for dist in sorted(directory.glob("*.dist-info")):
+            dtext = str(dist)
+            if dtext not in sys.path:
+                sys.path.append(dtext)
     return added
 
 

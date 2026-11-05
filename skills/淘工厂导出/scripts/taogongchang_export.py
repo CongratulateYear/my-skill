@@ -16,7 +16,11 @@ cookie 只在下载脚本内存中使用）；不落盘任何凭据。
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import re
+import tempfile
+import uuid
 import shutil
 import subprocess
 import sys
@@ -26,9 +30,8 @@ from pathlib import Path
 # asset-inventory skill 若还装着，其副本作为兼容回退。
 DOWNLOAD_SCRIPT = Path(__file__).resolve().with_name("tmall_bill_download.py")
 if not DOWNLOAD_SCRIPT.is_file():
-    DOWNLOAD_SCRIPT = Path(
-        "C:\\Users\\Administrator\\.dsh\\skills/asset-inventory/scripts/tmall_bill_download.py"
-    )
+    DOWNLOAD_SCRIPT = (Path(__file__).resolve().parents[2] / "asset-inventory"
+                       / "scripts" / "tmall_bill_download.py")
 
 # 中文名/别名 -> tmall_bill_download.py 的 --module 值
 MODULE_ALIASES = {
@@ -92,11 +95,17 @@ def safe_name(name: str) -> str:
     return cleaned or "未知公司"
 
 
+def folder_name(company: str, start: str | None, end: str | None) -> str:
+    """Public company/date folder naming helper (no filesystem side effects)."""
+    suffix = f"{start}_{end}" if start and end else "未给日期"
+    return f"{safe_name(company)}_{suffix}"
+
+
 def build_folder(output_root: Path, company: str, args: argparse.Namespace) -> Path:
     start = args.write_off_start or args.order_pay_start
     end = args.write_off_end or args.order_pay_end
-    suffix = f"{start}_{end}" if start and end else "未给日期"
-    return output_root / f"{safe_name(company)}_{suffix}"
+    root = getattr(args, "batch_folder", None) or output_root
+    return Path(root).expanduser().resolve() / folder_name(company, start, end)
 
 
 # 根目录裸文件名前缀 → 流程名（单流程裸跑/历史文件识别）
@@ -108,56 +117,124 @@ ROOT_PREFIX_RULES = tuple(sorted(
 
 
 def display_for_path(xlsx: Path, folder: Path, module_key: str | None) -> str | None:
-    """解析一个 xlsx 应该叫什么流程名：单流程模式优先用 wrapper 传入的 module。"""
-    if module_key and module_key in MODULE_DISPLAY_NAMES:
-        return MODULE_DISPLAY_NAMES[module_key]
-    # 多流程模式：从流程子目录名 asset-inventory-<module>-<起><止> 解析
+    """Infer ownership before applying a single-module fallback to unknown files."""
     for part in xlsx.relative_to(folder).parts[:-1]:
         m = re.match(r"^asset-inventory-(.+?)-\d{8}-\d{8}$", part)
         if m and m.group(1) in MODULE_DISPLAY_NAMES:
             return MODULE_DISPLAY_NAMES[m.group(1)]
-    # 根目录裸文件名前缀识别（如 处罚数据_2026-09-01_2026-09-30.xlsx、商品货款_500…）
-    stem = xlsx.stem
     for prefix, name in ROOT_PREFIX_RULES:
-        if stem == prefix or stem.startswith(prefix):
+        if xlsx.stem.startswith(prefix):
             return name
+    # Unknown files are deliberately NOT attributed to a selected module.
     return None
 
 
-def finalize_folder(folder: Path, module_key: str | None = None) -> list[Path]:
-    """导出成功后整理文件夹：最终 xlsx 以流程名命名放到根目录，删除其余全部内容。
+def _is_final(path: Path, display: str) -> bool:
+    return bool(re.fullmatch(re.escape(display) + r"(?:_[2-9]\d*|_1\d+)?", path.stem))
 
-    - 单流程模式把 module_key 传进来，所有 xlsx 一律按该流程命名；
-    - 多流程（module=all）模式从流程子目录名 asset-inventory-<module>-<起><止>
-      解析 module；根目录裸文件按前缀识别（商品货款→商品贷款、GEI@→所有商品
-      效果数据导出，其余按流程名前缀去后缀）；
-    - 已在根目录且名字就是流程名的文件跳过（幂等）；
-    - 重名 xlsx 追加 _2/_3 后缀，不覆盖；
-    - zip、_extracted 目录、流程子目录、状态文件等全部删除。
+
+def finalize_folder(folder: Path, module_key: str | None = None, *,
+                    output_folder: Path | None = None,
+                    modules: list[str] | None = None,
+                    outcomes: dict | None = None) -> list[Path]:
+    """Publish only owned XLSX files; preserve unrelated files and interrupted work.
+
+    New shards replace the complete old shard set, never append to it. Copies are
+    staged before any output is changed; failed publication restores old outputs
+    and leaves source files intact. Unknown files and other modules are untouched.
+    With output_folder, folder must be an isolated, successfully completed run;
+    zero-result selected modules then remove their previous final outputs.
     """
-    if module_key == "all":
-        module_key = None
-    kept: list[Path] = []
-    for xlsx in sorted(folder.rglob("*.xlsx")):
-        display = display_for_path(xlsx, folder, module_key)
-        target = folder / f"{display}.xlsx" if display else folder / xlsx.name
-        if xlsx.resolve() == target.resolve():
-            kept.append(xlsx)
+    folder = folder.resolve()
+    target_root = (output_folder or folder).resolve()
+    target_root.mkdir(parents=True, exist_ok=True)
+    keys = modules if modules is not None else (
+        [module_key] if module_key and module_key != "all" else list(MODULE_DISPLAY_NAMES))
+    selected = {MODULE_DISPLAY_NAMES[key] for key in keys}
+    groups: dict[str, list[Path]] = {}
+    for xlsx in sorted(folder.rglob("*")):
+        if any(part.startswith(".") for part in xlsx.relative_to(folder).parts[:-1]):
             continue
-        if target.exists():
-            stem, suffix = target.stem, target.suffix
-            n = 2
-            while target.exists():
-                target = folder / f"{stem}_{n}{suffix}"
-                n += 1
-        xlsx.rename(target)
-        kept.append(target)
-    for child in folder.iterdir():
-        if child.is_dir():
-            shutil.rmtree(child)
-        elif child.suffix.lower() != ".xlsx":
-            child.unlink()
-    return kept
+        if not xlsx.is_file() or xlsx.is_symlink() or xlsx.suffix.lower() != ".xlsx":
+            continue
+        if any(parent.is_symlink() for parent in xlsx.parents if parent != folder):
+            continue
+        display = display_for_path(xlsx, folder, None)
+        if display is None and output_folder is not None and len(keys) == 1:
+            display = MODULE_DISPLAY_NAMES[keys[0]]
+        if display not in selected:
+            continue
+        if target_root == folder and xlsx.parent == folder and _is_final(xlsx, display):
+            continue
+        groups.setdefault(display, []).append(xlsx)
+    if output_folder is not None:
+        if outcomes is None:
+            raise ValueError("发布需要显式 completed/zero 状态，不能由缺文件推断零数据")
+        groups = {}
+        for key in keys:
+            result = outcomes.get(key, {})
+            status = result.get("status")
+            files = result.get("publishFiles")
+            if status == "zero" and files == []:
+                continue
+            if status != "completed" or not isinstance(files, list) or not files:
+                raise ValueError(f"{key} 缺少有效发布清单；旧状态须重新导出，不能猜测零数据")
+            sources = []
+            for raw in files:
+                source = Path(raw).resolve()
+                raw_path = Path(raw).absolute()
+                unsafe_link = False
+                for part in [raw_path, *raw_path.parents]:
+                    if part.resolve() == folder:
+                        break
+                    if part.is_symlink():
+                        unsafe_link = True
+                if (not source.is_relative_to(folder) or not source.is_file()
+                        or source.suffix.lower() != ".xlsx" or unsafe_link):
+                    raise ValueError(f"{key} 发布源缺失或不安全；保留旧结果")
+                sources.append(source)
+            groups[MODULE_DISPLAY_NAMES[key]] = sources
+    affected = selected if output_folder is not None else set(groups)
+    published: list[Path] = []
+    # Transaction is inside the company folder (same filesystem on Windows/macOS).
+    with tempfile.TemporaryDirectory(prefix=".finalize-", dir=target_root) as temp:
+        staging = Path(temp)
+        plans: list[tuple[Path, Path]] = []
+        for display, sources in groups.items():
+            for index, source in enumerate(sources, 1):
+                name = f"{display}{'_' + str(index) if index > 1 else ''}.xlsx"
+                staged = staging / name
+                shutil.copy2(source, staged)
+                plans.append((staged, target_root / name))
+        old = [p for p in target_root.iterdir() if p.is_file() and not p.is_symlink()
+               and p.suffix.lower() == ".xlsx"
+               and any(_is_final(p, display) for display in affected)]
+        backups: list[tuple[Path, Path]] = []
+        try:
+            for index, path in enumerate(old):
+                backup = staging / f"backup-{index}"
+                os.replace(path, backup)
+                backups.append((backup, path))
+            for staged, target in plans:
+                os.replace(staged, target)
+                published.append(target)
+        except Exception:
+            for path in published:
+                path.unlink(missing_ok=True)
+            for backup, path in backups:
+                os.replace(backup, path)
+            raise
+    # Isolated runs retain ALL sources until main atomically retires the work
+    # directory. A cleanup interruption can never leave a resumable partial set.
+    if output_folder is None:
+        for sources in groups.values():
+            for source in sources:
+                source.unlink()
+    # Do not recursively delete directories: they can contain another module,
+    # unknown documents, or resume state. Main owns cleanup of isolated runs.
+    return sorted(p for p in target_root.iterdir() if p.is_file()
+                  and p.suffix.lower() == ".xlsx"
+                  and any(_is_final(p, display) for display in selected))
 
 
 def main() -> int:
@@ -172,33 +249,80 @@ def main() -> int:
     p.add_argument("--order-pay-end", help="支付结束 YYYY-MM-DD（用户给的支付日期）")
     p.add_argument("--fetch-file", type=Path,
                    help="用户贴的 queryBillDetail fetch 文本文件；省略则用本机浏览器登录态")
-    p.add_argument("--output-root", type=Path, default=Path("outputs"), help="输出根目录")
+    p.add_argument("--output-root", type=Path, default=Path.home() / "Downloads" / "淘工厂导出",
+                   help="输出根目录，默认 ~/Downloads/淘工厂导出")
+    p.add_argument("--batch-folder", type=Path, help="批次总目录；公司日期文件夹放在其内部，优先于 output-root")
+    p.add_argument("--browser", choices=["auto", "chrome", "chrome-beta", "chrome-canary", "edge", "brave", "chromium"])
+    p.add_argument("--transport", choices=["auto", "cookie", "bridge"])
+    p.add_argument("--bridge-url", help="原样透传给内置下载器")
     p.add_argument("--resume", action="store_true", help="跳过状态文件中已完成的流程")
     p.add_argument("--skip-module", action="append", default=[], help="跳过指定流程，可重复")
     p.add_argument("--dry-run", action="store_true", help="只显示请求计划，不实际导出")
     args = p.parse_args()
 
     module = MODULE_ALIASES.get(str(args.module).strip(), str(args.module).strip())
-    if not module:
-        print("错误：--module 不能为空", file=sys.stderr)
+    if module not in {"all", *MODULE_DISPLAY_NAMES}:
+        print("错误：--module 必须是已知流程", file=sys.stderr)
         return 2
 
+    # Pure local date validation before creating/quarantining any directory.
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("_export_download", DOWNLOAD_SCRIPT)
+    downloader = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(downloader)
+    keys = list(MODULE_DISPLAY_NAMES) if module == "all" else [module]
+    for key in keys:
+        try:
+            downloader.module_date_filters(args, {}, downloader.MODULES[key])
+        except ValueError as exc:
+            p.error(str(exc))
+
     folder = build_folder(args.output_root, args.company_name, args)
+    args.skip_module = [MODULE_ALIASES.get(key, key) for key in args.skip_module]
+    if any(key not in MODULE_DISPLAY_NAMES for key in args.skip_module):
+        p.error("未知 --skip-module")
+    work = folder / f".work-{module}"
     if not args.dry_run:
         folder.mkdir(parents=True, exist_ok=True)
+        if args.resume and not work.is_dir():
+            p.error("没有对应的未完成工作目录；成功导出后无需 --resume")
+        if not args.resume and work.exists():
+            # Never destroy an interrupted run just because a new export starts.
+            work.rename(folder / f".previous-{module}-{uuid.uuid4().hex}")
+        work.mkdir(exist_ok=True)
+        if args.resume:
+            states = list(work.glob("*.asset-inventory-state.json"))
+            if len(states) == 1:
+                completed = json.loads(states[0].read_text(encoding="utf-8")).get("completedModules", [])
+                # Keep completed module results; quarantine incomplete downloads
+                # so a retry cannot count their old shards as fresh data.
+                stale = [child for child in work.iterdir() if child != states[0]
+                         and (module != "all" and module not in completed or
+                              module == "all" and not any(
+                                  child.name.startswith(f"asset-inventory-{key}-") for key in completed))]
+                if stale:
+                    backup = folder / f".previous-{module}-{uuid.uuid4().hex}"
+                    backup.mkdir()
+                    for child in stale:
+                        child.rename(backup / child.name)
 
     cmd = [
         sys.executable, str(DOWNLOAD_SCRIPT),
         "--module", module,
         "--no-pan-suan",
-        "--output-dir", str(folder),
+        "--output-dir", str(work),
         # 店铺名传给下载脚本：处罚数据/赔付追缴的「店铺」列取 --shop-name
         "--shop-name", args.company_name,
+        "--expect-company", args.company_name,
     ]
     for key in ("write_off_start", "write_off_end", "order_pay_start", "order_pay_end"):
         value = getattr(args, key)
         if value:
             cmd += [f"--{key.replace('_', '-')}", value]
+    for key in ("browser", "transport", "bridge_url"):
+        value = getattr(args, key)
+        if value is not None:
+            cmd += ["--" + key.replace("_", "-"), value]
     if args.fetch_file:
         cmd += ["--fetch-file", str(args.fetch_file)]
     for skip in args.skip_module:
@@ -215,7 +339,29 @@ def main() -> int:
     if args.dry_run:
         return proc.returncode
     if proc.returncode == 0:
-        kept = finalize_folder(folder, module)
+        states = list(work.glob("*.asset-inventory-state.json"))
+        if len(states) != 1:
+            raise ValueError("缺少唯一执行状态；拒绝发布")
+        state = json.loads(states[0].read_text(encoding="utf-8"))
+        skipped = set(state.get("manualSkippedModules", [])) | set(args.skip_module)
+        selected = [key for key in MODULE_DISPLAY_NAMES
+                    if key not in skipped and (module == "all" or key == module)]
+        completed = set(state.get("completedModules", []))
+        if not set(selected).issubset(completed):
+            raise ValueError("执行状态含未完成流程；拒绝发布")
+        kept = finalize_folder(work, module, output_folder=folder, modules=selected,
+                               outcomes=state.get("results", {}))
+        # Only this invocation's isolated working directory is disposable.
+        if work.parent != folder or not work.name.startswith(".work-"):
+            raise RuntimeError("拒绝清理非工作目录")
+        # Rename is atomic on this filesystem. Before it: all sources remain
+        # resumable. After it: partial cleanup is NEVER offered as a resume run.
+        retired = folder / f".published-{module}-{uuid.uuid4().hex}"
+        work.rename(retired)
+        try:
+            shutil.rmtree(retired)
+        except OSError:
+            print(f"警告：发布已完成，清理中断；保留目录 {retired.name}，不要用于 --resume", file=sys.stderr)
         print(f"\n导出完成，最终 xlsx 共 {len(kept)} 个，全部在：{folder}")
         for path in kept:
             print(f"  - {path.name}")

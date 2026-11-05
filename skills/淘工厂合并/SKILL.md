@@ -19,26 +19,40 @@ description: 把多个淘工厂 Excel 合并成一个盘算式工作簿（xlsx�
 2. **结算日期**（`--settlement-date`）：`YYYY-MM-DD` 单日或 `YYYY-MM-DD_YYYY-MM-DD` 区间（`~` 分隔也接受）；**用户没给就用当天日期**。
 3. **文件来源（二选一）**：
    - 用户直接给文件：`--files 路径1 路径2 …`
-   - 「淘工厂导出」生成的文件夹：默认 `--export-root ~/Downloads/淘工厂导出`，脚本按 `<公司名称>_<结算日期>` 自动定位文件夹；文件夹名对不上时用 `--export-folder` 直接指定路径。
+   - 「淘工厂导出」生成的文件夹：默认 `--export-root ~/Downloads/淘工厂导出`，脚本按 `<公司名称>_<结算日期>` 自动定位公司文件夹。
+   - 批次目录：`--batch-folder /path/批次目录`，在该目录内定位 `<公司名称>_<结算日期>/`；不混读其他公司。
+   - `--export-folder /path/公司导出目录` 直接指定公司文件夹，明确提供时优先于 `--batch-folder` 和 `--export-root`。`--files` 仍表示直接文件模式，优先于文件夹模式。
 
 用户随消息发来的账号/密码在本 skill 里用不上（不联网）；若发现导出文件夹缺失或数据要更新，提示用户改用「淘工厂导出」重新导出。
 
+## 身份与公司边界
+
+- 纯本地合并不读取登录手机号、`erpMobile` 或 cookie，不新增账号约束。公司名称仍取用户原文，用于公司目录定位、命名及店铺列；不得从手机号反推公司，不混读其他公司。
+- 若转入登录/重新导出，身份以公司名称为准，必须校验目标公司；同公司多个登录手机号不因 `erpMobile` 不同阻断。不要自动将登录手机号传成 `--expect-account`；只有用户明确要求才启用 `--expect-account <指定账号> --strict-account`。
+- 身份策略不影响合并识别、汇总、公式和模板；输出目录遵循下方同级并列规则。
+
 ## 执行命令
 
+先将 `SKILL_DIR` 设为当前加载的本技能实际目录（可名为 `淘工厂合并` 或 `taogongchang-merge`），不要固定用户名、盘符或技能目录名称。以下为 bash 示例；Windows PowerShell 用 `$env:SKILL_DIR` 代替 `$SKILL_DIR`，启动命令可用 `python`。
+
 ```bash
+# SKILL_DIR=/实际技能目录（由加载结果确定，路径含空格/中文时保持引号）
 # 方式1：用户直接给文件
-python3 C:\\Users\\Administrator\\.dsh\\skills/淘工厂合并/scripts/merge_excel.py \
+python3 "$SKILL_DIR/scripts/merge_excel.py" \
   --company-name 埔鸣 \
   --settlement-date 2026-09-01_2026-10-31 \
   --files /path/交易佣金.xlsx /path/商品贷款.xlsx
 
 # 方式2：合并「淘工厂导出」生成的文件夹（结算日期没给 → 当天）
-python3 C:\\Users\\Administrator\\.dsh\\skills/淘工厂合并/scripts/merge_excel.py \
+python3 "$SKILL_DIR/scripts/merge_excel.py" \
   --company-name 埔鸣 \
   --settlement-date 2026-09-01_2026-10-31
 
 # 导出文件夹名对不上时直接指定
 ... --export-folder ~/Downloads/淘工厂导出/埔鸣_2026-09-01_2026-10-31
+
+# 批次中定位公司目录；主表与公司原始导出目录并列放在批次总目录
+... --batch-folder /path/本次批次目录
 
 # 分多批合并用户文件时：第二批起加 --accumulate 在已有输出上续并（保留公司汇总手工列）
 ... --files 批次2.xlsx --accumulate
@@ -46,16 +60,20 @@ python3 C:\\Users\\Administrator\\.dsh\\skills/淘工厂合并/scripts/merge_exc
 
 ## 输出
 
-- 合并文件：`<输出目录>/<公司名称>_<结算日期>.xlsx`；输出目录默认=导出根目录（方式2）或第一个文件所在目录（方式1），`--output-dir` 可覆盖。
+- 合并文件：`<输出目录>/<公司名称>_<结算日期>.xlsx`；文件夹模式默认输出到**定位到的公司导出文件夹的父目录**，与原始导出文件夹并列。单公司为 `<导出根>/<公司_日期>/` + `<导出根>/<公司_日期>.xlsx`；多公司复用同一个 `--batch-folder`，每家公司这两个产物直接放在批次总目录，不增加公司包装目录。`--export-folder` 指定任意公司目录时同样输出到其父目录（相对路径先解析）。`--files` 模式保持第一个文件所在目录；`--output-dir` 显式指定始终优先。
+- 仅影响本次及后续合并输出位置；不移动或删除既有真实结果，旧主表仍按下述规则过滤。
 - 结构（= 盘算模板的 Sheet 结构）：**公司汇总**（店铺/运营姓名/商品ID/产品名称/数量/收入/交易补贴/交易佣金/先用后付/消费者体验提升服务/客服服务费/新疆物流集运/出海增值服务费/赔付追缴/新品营销(营销费用)/评价有礼/商业化账户充值提现/充值加码消耗/智能优惠券金额/投流推广佣金/淘客推广佣金/直播推广佣金/刷单金额/罚款/直通车营销/收入金额/收款人/货款/利润/备注（查询不到的） 30 列）+ 使用说明/数据检查/id汇总/中间表 + 各流程明细 Sheet + 费用归集辅助/未归属费用。
 - 商品清单自动取自各流程明细 Sheet 的商品ID；公司汇总金额列是引用明细 Sheet 的公式；「总计」行=商品行合计+客服服务费/赔付追缴/评价有礼/商业化账户充值提现整表合计。
-- 默认从干净模板**重建**（幂等：同一批源文件产出相同结果）；`--accumulate` 才在已有输出上续并，且公司汇总手工列（运营姓名等）按商品ID保留。
+- 默认从干净模板**重建**（幂等：同一批源文件产出相同结果）；`--accumulate` 才在已有输出上续并：同一流程的已有真实明细与新明细按完整行去重追加，未涉及流程保留；重复续并不重复记账，公司汇总手工列（运营姓名、备注等）按商品ID保留。底层构建器显式接收 `--accumulate`，不是仅把旧输出当模板后覆盖明细。
 - 公式缓存：默认用 LibreOffice 无界面计算后写入（机器上没有 soffice 时自动跳过，Excel/WPS 打开时计算）；`--no-recalculate` 关闭。
 
 ## 注意
 
-- 流程识别沿用 pan_suan_builder 规则：先按文件名前缀（商品贷款/商品货款→商品货款 Sheet），再按表头签名；无法识别的文件**默认跳过并在 stderr 提示**，`--strict` 改为直接失败。
-- 含「公司汇总」Sheet 的文件（如上次合并的输出）不会被再次吞入。
-- **所有商品效果数据导出.xlsx 缺工作表 dimension**：pan_suan_builder 已处理（read_only 误读时回退全量加载）。
-- 运行脚本用 `python3` 即可，实际盘算构建在带 openpyxl 的 Python 里执行（`CODEX_SPREADSHEET_PYTHON` 可强制指定）。
-- `pan_suan_builder.py` 与 `assets/盘算模板.xlsx` 已内置本 skill（`scripts/` 与 `assets/`），不依赖 asset-inventory；子进程统一以 UTF-8 编码通信（Windows GBK 控制台下也不会崩）。
+- 流程识别沿用 pan_suan_builder 规则：先按文件名前缀（商品贷款/商品货款→商品货款 Sheet），再按表头签名；只有无法识别类型的可读文件**默认跳过并在 stderr 提示**，`--strict` 改为直接失败。读取失败、坏 ZIP/XML、已识别流程但表头不匹配/缺列均直接失败，不可当未知来源吞掉；零个来源成功读取时禁止生成或替换输出。表头合法、零条明细的账单算成功，不要求必须有数据行。底层显式 `--expected-target --allow-empty-target` 仅允许确实无候选来源时清空目标，不能掩盖坏来源；全流程完整性由父级编排检查。
+- 日期用真实日历校验；无效日期（如 2026-02-30）及开始晚于结束均报错，不静默反转区间。
+- 合并前过滤本次输出路径和所有含「公司汇总」Sheet 的工作簿（包括改名、旧日期、流程名前缀的盘算文件）；自动扫描忽略 `~$` 临时文件。即使 `--strict` 也不会把生成的盘算工作簿当作流程输入；若过滤后没有源文件则报错，不生成空盘算。
+- **所有商品效果数据导出.xlsx 缺工作表 dimension**：pan_suan_builder 已处理（dimension 缺失导致 `max_row`/`max_column` 为 None，或误标 A1 时回退全量加载；正常 dimension 保留 read_only 路径）。
+- 启动脚本用可用的 `python3`/`python`；实际盘算构建会依次探测可导入 openpyxl 的解释器：`CODEX_SPREADSHEET_PYTHON`（可为路径或 PATH 命令）、`sys.executable`、PATH 的 `python`/`python3`、当前用户 Windows DSH/Codex runtime 与兼容 Codex 缓存 runtime、macOS `/tmp/aivenv/bin/python`、`~/.local/bin/python3.12`/`python3.13`。不安装依赖、不联网；无可用解释器时明确报错。保留虚拟环境 python 路径、不解引用符号链接，避免丢失 openpyxl 环境。
+- `pan_suan_builder.py` 与 `assets/盘算模板.xlsx` 优先从本 skill 的 `scripts/`、`assets/` 成对读取，与技能中文/英文目录名无关；仅内置资源不完整时，按当前技能的父目录动态查找同级 `asset-inventory` 或 `资产盘算` 的完整资源对。不固定 Windows 用户/盘符，不安装其他技能。子进程统一以 UTF-8 编码通信（Windows GBK 控制台下也不会崩）。
+
+身份字段说明：`erpMobile` 仅为 ERP 绑定信息，不代表当前实际登录手机号；公司名称才是默认身份判据。

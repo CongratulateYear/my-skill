@@ -11,7 +11,7 @@ Prints ONE JSON object on stdout so callers can branch on it, and exits with:
   1  ERROR        unexpected failure (keychain / DPAPI / decrypt / cookie db)
 
 Transport: --transport auto (default) reads the local cookie store first and
-falls back to the browser bridge (asset-inventory's browser_bridge.py + an
+falls back to the browser bridge (this skill's browser_bridge.py + an
 injected agent in the logged-in tgc.tmall.com tab) when the store cannot be
 read at all (Windows v20 app-bound encryption, Edge-exclusive Cookies file,
 sandbox denying the temp area).
@@ -20,15 +20,12 @@ This script never opens a browser window, never launches a second browser, and
 never touches a password: driving the form is the agent's job (SKILL.md
 「登录流程」). It only reports state, plus the concrete next `action` for the
 agent, and can optionally wait for the login to land so the caller does not
-race the browser. Pass `--expect-account <手机号或账号提示>` so a
-still-logged-in previous account is reported as `wrong-account` instead of a
-false success: phone numbers are compared against the platform's masked
-erpMobile (accountInfo.dingdingMobile), non-phone hints against the cookie
-hint; when neither is comparable the result is `accountCheck: unverified`
-(non-blocking) instead of a false wrong-account. Pass `--expect-company <名称>`
-(user usually sends the short company/shop name, e.g. 埔鸣) so a logged-in
-session of a DIFFERENT company is reported as `wrong-company` instead of a
-false success.
+race the browser. Identity defaults to the expected COMPANY: several login
+phones may belong to one company, and accountInfo erpMobile is not proof of
+which phone logged in. --expect-account is diagnostic when --expect-company
+matches; add --strict-account to block a comparable account mismatch. Without
+--expect-company, --expect-account keeps the legacy account-only check.
+Company mismatch/unknown always blocks before account checks.
 """
 from __future__ import annotations
 
@@ -59,7 +56,7 @@ ACTION = {
         "本机读不到登录态，浏览器桥也未接入。两条路任选其一："
         "① 用 magpie-browser 找 tgcwork.tmall.com 标签（没有就 tab_new 在【当前已打开的"
         f"浏览器】里打开 {LOGIN_URL}）完成登录后重跑本命令；"
-        "② 浏览器里其实已登录时，后台启动 asset-inventory 的 browser_bridge.py"
+        "② 浏览器里其实已登录时，后台启动本 skill 自带的 scripts/browser_bridge.py"
         "（默认端口 8899），再在已登录的 tgc.tmall.com 标签里用 evaluate 注入"
         " <script src=http://127.0.0.1:8899/agent.js></script>，然后重跑本命令。"
     ),
@@ -160,12 +157,15 @@ def main(argv: list[str] | None = None) -> int:
                         help="浏览器里刚点完登录时，最多等这么多秒让 cookie 落库")
     parser.add_argument("--interval", type=float, default=2.0, help="轮询间隔秒数")
     parser.add_argument("--expect-account", default="",
-                        help="期望登录的账号（手机号或账号提示）；手机号只与平台脱敏 erpMobile 比对，"
-                             "比对不上时报 unverified 而不是 wrong-account")
+                        help="账号提示；公司匹配时默认仅诊断，不作为登录身份约束")
+    parser.add_argument("--strict-account", action="store_true",
+                        help="显式严格账号核对：可比账号不匹配仍报 wrong-account；须同时给 --expect-account")
     parser.add_argument("--expect-company", default="",
                         help="期望的公司/店铺名（用户通常发简称，如「埔鸣」）；"
                              "登录的公司不匹配时判为 wrong-company")
     args = parser.parse_args(argv)
+    if args.strict_account and not args.expect_account.strip():
+        parser.error("--strict-account requires --expect-account")
 
     started = time.monotonic()
     expected = args.expect_account.strip()
@@ -173,21 +173,6 @@ def main(argv: list[str] | None = None) -> int:
     bridge_url = args.bridge_url or None
 
     def judge(state: dict) -> dict:
-        if expected and state["loggedIn"]:
-            verdict = tmall_session.account_verdict(
-                expected, str(state.get("erpMobile") or ""), str(state.get("accountHint") or ""))
-            if verdict == "mismatch":
-                state.update({
-                    "loggedIn": False,
-                    "reason": "wrong-account",
-                    "expectedAccount": expected,
-                    "action": ACTION["wrong-account"],
-                })
-            elif verdict == "unverified":
-                state["accountCheck"] = (
-                    f"unverified：无法核对账号（expected={expected}，erpMobile/提示均不可比），未阻断")
-            else:
-                state["accountCheck"] = "ok"
         if expected_company and state["loggedIn"]:
             actual_company = str(state.get("company") or "")
             if not actual_company:
@@ -205,6 +190,25 @@ def main(argv: list[str] | None = None) -> int:
                     "expectedCompany": expected_company,
                     "action": ACTION["wrong-company"],
                 })
+        if expected and state["loggedIn"]:
+            verdict = tmall_session.account_verdict(
+                expected, str(state.get("erpMobile") or ""), str(state.get("accountHint") or ""))
+            state["accountCheck"] = verdict
+            if verdict == "mismatch" and (args.strict_account or not expected_company):
+                state.update({
+                    "loggedIn": False,
+                    "reason": "wrong-account",
+                    "expectedAccount": expected,
+                    "action": ACTION["wrong-account"],
+                })
+            elif verdict == "mismatch":
+                state["accountCheck"] = "mismatch-ignored-company-match"
+                state["accountNote"] = "公司匹配；登录手机号与 erpMobile 可不同，不阻断。"
+            elif verdict == "unverified":
+                state["accountCheck"] = (
+                    f"unverified：无法核对账号（expected={expected}，erpMobile/提示均不可比），未阻断")
+            else:
+                state["accountCheck"] = "ok"
         return state
 
     try:

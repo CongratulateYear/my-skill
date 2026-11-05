@@ -50,14 +50,12 @@ XSRF_COOKIE_NAMES = ("XSRF-TOKEN", "X-XSRF-TOKEN")
 # Identity cookies, most reliable first; empty values are skipped.
 HINT_COOKIE_ORDER = ("tracknick", "lgc", "cookie17", "unb", "sn")
 
-# DSH Windows: load vendored cryptography from the shared skill vendor dir
-_vendor = Path(__file__).resolve().parents[2] / '.vendor'
-if _vendor.is_dir():
-    for _p in (_vendor, *sorted(_vendor.glob('*.dist-info'))):
-        if str(_p) not in sys.path:
-            sys.path.append(str(_p))
+_SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+import _bootstrap  # noqa: E402,F401  (adds the skill's vendored libraries)
 
-IS_WINDOWS = sys.platform.startswith("win")
+IS_WINDOWS = sys.platform.startswith("win") or os.name == "nt"
 
 # browser key -> {dir, label?, name, win_dir?}
 BROWSERS: dict[str, dict[str, str]] = {
@@ -78,6 +76,12 @@ BROWSERS: dict[str, dict[str, str]] = {
         "label": "Chrome Safe Storage",
         "name": "Google Chrome Beta",
         "win_dir": r"Google\Chrome Beta\User Data",
+    },
+    "chrome-canary": {
+        "dir": "Google/Chrome Canary",
+        "label": "Chrome Safe Storage",
+        "name": "Google Chrome Canary",
+        "win_dir": r"Google\Chrome SxS\User Data",
     },
     "brave": {
         "dir": "BraveSoftware/Brave-Browser",
@@ -113,9 +117,7 @@ WINDOWS_COOKIE_LOCK_HINT = (
 
 def _user_data_root(browser: str) -> Path:
     if IS_WINDOWS:
-        local = os.environ.get("LOCALAPPDATA")
-        if not local:
-            raise SessionError("未设置 LOCALAPPDATA，无法定位浏览器用户数据目录")
+        local = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
         return Path(local) / BROWSERS[browser]["win_dir"]
     return Path.home() / "Library" / "Application Support" / BROWSERS[browser]["dir"]
 
@@ -142,6 +144,7 @@ def cookie_files(browser: str) -> list[Path]:
         if str(p) not in seen:
             seen.add(str(p))
             unique.append(p)
+    unique.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
     return unique
 
 
