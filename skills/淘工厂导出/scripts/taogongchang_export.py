@@ -258,6 +258,8 @@ def main() -> int:
     p.add_argument("--resume", action="store_true", help="跳过状态文件中已完成的流程")
     p.add_argument("--skip-module", action="append", default=[], help="跳过指定流程，可重复")
     p.add_argument("--dry-run", action="store_true", help="只显示请求计划，不实际导出")
+    p.add_argument("--result-file", type=Path, help="本次发布凭证JSON（供总编排核实，不含凭据）")
+    p.add_argument("--run-id", help="总编排本次运行标识")
     args = p.parse_args()
 
     module = MODULE_ALIASES.get(str(args.module).strip(), str(args.module).strip())
@@ -351,6 +353,24 @@ def main() -> int:
             raise ValueError("执行状态含未完成流程；拒绝发布")
         kept = finalize_folder(work, module, output_folder=folder, modules=selected,
                                outcomes=state.get("results", {}))
+        if args.result_file:
+            import hashlib
+            receipt = {
+                "version": 1, "run_id": args.run_id,
+                "company": args.company_name, "folder": str(folder.resolve()),
+                "dates": {key: getattr(args, key) for key in
+                          ("order_pay_start", "order_pay_end", "write_off_start", "write_off_end")},
+                "module": module, "skipped": sorted(skipped),
+                "results": {key: {"status": state["results"][key]["status"]} for key in selected},
+                "files": {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in kept},
+            }
+            args.result_file.parent.mkdir(parents=True, exist_ok=True)
+            temporary = args.result_file.with_name(args.result_file.name + ".tmp-" + uuid.uuid4().hex)
+            with temporary.open("x", encoding="utf-8") as stream:
+                json.dump(receipt, stream, ensure_ascii=False, indent=2)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, args.result_file)
         # Only this invocation's isolated working directory is disposable.
         if work.parent != folder or not work.name.startswith(".work-"):
             raise RuntimeError("拒绝清理非工作目录")

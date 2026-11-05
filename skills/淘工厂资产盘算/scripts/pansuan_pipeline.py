@@ -1,22 +1,9 @@
 #!/usr/bin/env python3
-"""淘工厂资产盘算：单公司流水线 —— 登录闸门 → 淘工厂导出 → 淘工厂合并。
+"""淘工厂资产盘算：单公司登录 → 导出 → 条件ERP → 一次严格合并 → 校验。
 
-三种用法（对应 SKILL.md 的调用词映射）：
-  淘工厂资产盘算          --mode full（默认）  登录验证 → 导出全部17流程 → 合并盘算工作簿
-  淘工厂资产盘算导出      --mode export        登录验证 → 导出全部17流程（不合并）
-  淘工厂资产盘算导出罚款  --mode export --module 罚款   登录验证 → 仅导出罚款（处罚数据）
-
-依赖（安装本 skill 时必须一并安装，缺一不可）：
-  淘工厂登录 <skills-root>/淘工厂登录/
-  淘工厂导出 <skills-root>/淘工厂导出/
-  淘工厂合并 <skills-root>/淘工厂合并/
-脚本启动时逐一自检，缺哪个就报清单并退出。
-
-多公司：本脚本一次只处理一家公司。多公司由上层按用户给定顺序逐家调用，
-必须等上一家全部完成（含合并）才轮到下一家；换公司前先按「淘工厂登录」
-的流程在当前浏览器里退出并登录目标公司。
-
-退出码：0=成功；2=参数/依赖错误；3=需要先完成浏览器登录；其他=导出/合并失败。
+公司级日志复用本次发布凭证；ERP失败后续跑不重导已完成账单。
+多公司仍由上层严格串行。凭据仅内存，ERP身份约束独立提供。
+退出码0=流水线完成（仍需查看ERP部分缺单报告），3=登录需干预，其他=失败。
 """
 from __future__ import annotations
 
@@ -125,11 +112,16 @@ def main() -> int:
     p.add_argument("--batch-folder", type=Path, help="多公司共用的批次总目录；各公司仍严格串行")
     p.add_argument("--output-dir", type=Path, help="显式覆盖合并输出目录；默认与公司导出文件夹并列（导出根或批次总目录）")
     p.add_argument("--dry-run", action="store_true", help="离线显示执行命令，不登录、不导出、不写文件")
+    p.add_argument("--erp-transport", choices=["auto", "cookie", "bridge"], default="auto")
+    p.add_argument("--erp-expect-company", help="用户明确指定的ERP公司，不从淘工厂简称推断")
+    p.add_argument("--erp-browser", default="auto")
+    p.add_argument("--erp-bridge-url", help="独立ERP桥，默认8901；不复用淘工厂桥")
     args = p.parse_args()
     if args.strict_account and not (args.expect_account or "").strip():
         p.error("--strict-account requires --expect-account")
-    if not args.company_name.strip():
-        p.error("--company-name 不能为空")
+    if (not args.company_name.strip() or re.search(r'[\\/:*?"<>|]', args.company_name)
+            or args.company_name in ('.', '..') or args.company_name.endswith(('.', ' '))):
+        p.error("公司名称为空或含不安全文件名字符")
     # Validate supplied dates before login, network requests, or directory writes.
     for prefix in ("order_pay", "write_off"):
         start, end = (getattr(args, prefix + suffix) for suffix in ("_start", "_end"))
@@ -153,6 +145,8 @@ def main() -> int:
                 raise ValueError("开始日期不能晚于结束日期")
         except ValueError as exc:
             p.error(f"--settlement-date 无效：{exc}")
+    if not args.order_pay_start or not args.write_off_start:
+        p.error("支付和结算日期区间均须提供")
     args.export_root = args.export_root.expanduser().resolve()
     if args.batch_folder:
         args.batch_folder = args.batch_folder.expanduser().resolve()
@@ -167,25 +161,14 @@ def main() -> int:
     transport_args = ["--browser", args.browser, "--transport", args.transport]
     if args.bridge_url:
         transport_args += ["--bridge-url", args.bridge_url]
-    if args.fetch_file is None and not args.dry_run:
+    gate_cmd = None
+    if args.fetch_file is None:
         gate_cmd = [sys.executable, ensure_login, "--expect-company", args.company_name,
                     "--wait", str(max(args.login_wait, 0.0)), *transport_args]
         if args.expect_account:
             gate_cmd += ["--expect-account", args.expect_account]
         if args.strict_account:
             gate_cmd.append("--strict-account")
-        rc, state = run_gate(gate_cmd)
-        if rc == 3:
-            reason = state.get("reason", "未知原因")
-            action = state.get("action") or (
-                "按「淘工厂登录」skill 在【当前已打开的浏览器】里完成登录/切换"
-                "（不要新开浏览器），完成后重跑本命令。")
-            print(f"\n需要先完成浏览器登录/切换（{reason}）：{action}", file=sys.stderr)
-            return 3
-        if rc != 0:
-            detail = state.get("detail") or state.get("action") or "无详情"
-            print(f"登录闸门异常（exit {rc}）：{detail}", file=sys.stderr)
-            return rc
 
     # 2) 导出
     export_cmd = [
@@ -205,16 +188,15 @@ def main() -> int:
         export_cmd += ["--batch-folder", str(args.batch_folder)]
     if args.resume:
         export_cmd.append("--resume")
-    if args.dry_run:
-        print("DRY RUN: 登录闸门以公司为准；指定账号默认仅诊断，--strict-account 才阻断账号不符。")
-        print("+", " ".join(export_cmd), flush=True)
-        rc = 0
-    else:
-        rc = run(export_cmd)
-    if rc != 0:
-        print(f"淘工厂导出失败（exit {rc}）；已成功流程的文件保留在导出文件夹，"
-              f"可加 --resume 续跑", file=sys.stderr)
-        return rc
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("tgc_export_layout", export_script)
+    layout = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(layout)
+    company_folder = layout.build_folder(args.batch_folder or args.export_root, args.company_name, args)
+    args.canonical_module = layout.MODULE_ALIASES.get(module, module)
+    if args.canonical_module not in {"all", *layout.MODULE_DISPLAY_NAMES}:
+        p.error("未知流程")
+    merge_cmd = None
 
     # 3) 合并：仅 full + 全部流程 时执行
     if args.mode == "full" and is_all_module:
@@ -235,29 +217,27 @@ def main() -> int:
             merge_cmd += ["--settlement-date", settlement]
         # 始终显式定位本次导出的公司目录，避免自定义结算标签导致匹配错目录。
         # 合并默认输出到该目录的父目录，主表与原始导出目录并列；不增加公司包装层。
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("tgc_export_layout", export_script)
-        layout = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(layout)
-        company_folder = layout.build_folder(args.batch_folder or args.export_root, args.company_name, args)
         merge_cmd += ["--export-folder", str(company_folder)]
         if args.output_dir:
             merge_cmd += ["--output-dir", str(args.output_dir.expanduser().resolve())]
-        if args.dry_run:
-            print("+", " ".join(merge_cmd), flush=True)
-            rc = 0
-        else:
-            rc = run(merge_cmd)
-        if rc != 0:
-            print(f"淘工厂合并失败（exit {rc}）", file=sys.stderr)
-            return rc
     elif args.mode == "full":
         print("仅导出部分流程（--module 非 all），跳过合并；需要合并时跑「淘工厂合并」skill")
     else:
         print("export 模式：不合并；需要合并时跑「淘工厂合并」skill")
 
-    print(f"\n淘工厂资产盘算流水线完成：{args.company_name}")
-    return 0
+    if args.dry_run:
+        print("DRY RUN: 登录 → 导出 → 本次有效罚款条件ERP → 一次严格合并 → 校验")
+        print("+", " ".join(export_cmd))
+        if merge_cmd:
+            print("+", " ".join(merge_cmd))
+        return 0
+    from company_run import execute
+    try:
+        return execute(args, company_folder, export_cmd, merge_cmd, run, run_gate,
+                       gate_cmd, resolve_skill_script)
+    except (ValueError, OSError, KeyError) as exc:
+        print(f"流水线未完成：{exc}；保留成果，同批次 --resume", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

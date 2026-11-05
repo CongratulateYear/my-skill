@@ -113,3 +113,7 @@ python "<本技能目录>/scripts/taogongchang_export.py" \
 - 共享 vendor 目录 `<skills根>/.vendor`（装淘工厂登录 skill 时已就位）。
 
 身份字段说明：`erpMobile` 仅为 ERP 绑定信息，不代表当前实际登录手机号；公司名称才是默认身份判据。
+
+## 编排发布凭证
+
+总编排使用 `--run-id` 与 `--result-file` 在工作目录退休前写出本次公司/日期/模块状态/发布文件SHA256摘要；不含Cookie、headers或下载签名URL。缺失/过期凭证不允许因旧表存在触发ERP。独立导出原用法不变。公司级续跑仅适用新版编排创建的新批次，历史业务目录不自动迁移。
