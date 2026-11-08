@@ -1,196 +1,128 @@
 ---
 name: taogongchang-login
-description: 淘工厂（tgcwork/tgc.tmall.com）登录与 token 获取：默认直接复用本机浏览器已登录的天猫会话（只读本机 cookie 库，无需浏览器在线），cookie 库读不到时（v20 应用绑定加密 / Edge 独占锁定 / 沙箱拦临时区）自动回退浏览器桥（后台起内置 browser_bridge.py + magpie 在已登录的 tgc 标签页注入 agent，同样不新开浏览器）；登录态失效时用 magpie-browser 在当前已经打开的浏览器里自动登录（先判断 magpie-browser 是否可用，不可用给出提示；绝不新开浏览器/新 profile，一律在新开的 Magpie 标签页里操作、不复用已有标签页；不落盘密码）；支持公司名校验（用户发来公司名称时用 --expect-company 验证登录账号是否属于该公司，不匹配报 wrong-company）；公司优先：同公司多个登录手机号不因 erpMobile 不同阻断；--expect-account 默认诊断，--strict-account 显式严格核对；登录失败分类处理（滑块验证提示用户滑动、账号密码错误提示用户、账号失效提示用户）；获取的 cookie/XSRF token/完整请求头可供其他 skill 以子进程 JSON 或 import tmall_session 两种方式在内存中引用，绝不落盘。跨平台：macOS+Chrome（钥匙串 AES-CBC）与 Windows+Edge（DPAPI AES-GCM，v20 及锁库场景走桥）。当用户说「登录淘工厂/天猫」「获取天猫 token」「拿一下 XSRF」「检查天猫登录态」，或其他 skill 调天猫接口前需要登录态/token 时使用。
+description: 淘工厂登录与 token 获取。默认只读本机 cookie 库，读不到自动回退本 skill 自带浏览器桥。恢复固定路线：在当前已打开浏览器中新建自己的 Magpie 标签页，不复用用户或其他 agent 标签；已登录直接桥接，确认未登录才填表；read 随 skill 的 bridge_agent.js 源码并 evaluate 直接执行；以服务端登录态及目标公司验证通过为成功标准。no-session 不等于未登录。凭据不落盘、不回显，验证码人工完成，不新开浏览器或 profile。支持 macOS/Windows、公司及账号校验，供其他 skill 在内存中复用会话。
 ---
 
-# 淘工厂登录（淘工厂登录与 token 获取）
+# 淘工厂登录（登录恢复与 token 获取）
 
-## 用途
+## 用途与环境
 
-用 magpie-browser 在**用户当前已经打开的浏览器**（绝不新开浏览器/新 profile）里、于**新开的 Magpie 标签页**中完成淘工厂（tgcwork.tmall.com）登录，然后从本机浏览器 cookie 库解密出会话，校验并输出可直接调天猫接口的 **XSRF token**（及完整请求头）。用户发来**公司名称**时，登录后必须校验登录账号是否属于该公司。
+用于登录淘工厂/天猫、检查登录态、获取 XSRF，或供其他 skill 在调用接口前取得会话。
+默认 `--transport auto` 先读本机 cookie 库（不要求浏览器在线），失败自动回退本 skill 自带的浏览器桥。macOS 支持 Chrome/Edge/Brave/Chromium（钥匙串 AES-CBC）；Windows 支持 Edge/Chrome（DPAPI AES-GCM）。v20 应用绑定加密或锁库时走桥，不关闭浏览器、不换 profile、不修改浏览器安全设置。
 
-适用于：
-- 用户说「登录天猫 / 淘工厂」「获取天猫 token」「拿一下 XSRF」「检查天猫登录态」；
-- 用户发来「公司名 + 账号 + 密码」要求登录某个公司的淘工厂账号；
-- 其他 skill（账单下载、数据导出等）在调用天猫接口前需要登录态/token 时，先走本 skill。
-
-## 支持的环境
-
-| 环境 | 浏览器 | cookie 加密 |
-|---|---|---|
-| macOS + Chrome（magpie-browser） | Chrome（也支持 Edge/Brave/Chromium） | macOS 钥匙串 Safe Storage + AES-CBC |
-| Windows + Edge（magpie-browser） | Edge（也支持 Chrome） | DPAPI（Local State 主密钥）+ AES-GCM |
-
-脚本自动按 `sys.platform` 分支：macOS 走钥匙串，Windows 走 `%LOCALAPPDATA%\<浏览器>\User Data\Local State` 的 `os_crypt.encrypted_key`（经 `CryptUnprotectData` 解出）。cookie 库位置两种布局都兼容：`<profile>/Cookies` 与 `<profile>/Network/Cookies`。
-
-## 流程（agent 按此执行）
-
-### 0. 先判断 magpie-browser 是否可用（登录动作的前置检查）
-
-调 magpie-browser `browser` 工具 `action: "browsers"`：
-
-- 返回已有会话（如 `b1 Chrome 156`）→ 可用，后面登录动作就用它。
-- 返回为空（浏览器没启动）→ macOS 先 `open -a "Google Chrome"`、Windows 先启动用户原本的 Edge（同一个 profile，不是新装实例），然后每 2 秒调一次 `browsers`，最多等 20 秒等 Magpie 扩展连上。
-- 20 秒后仍为空（扩展没装/没启用）→ **明确提示用户**：「magpie-browser 不可用：请确认 Magpie Browser 扩展已安装并启用、浏览器已打开」，然后停止登录动作。**不要自己另起浏览器或另建 profile**。
-- 纯检查登录态 / 取 token 优先走本机 cookie 库（不需要浏览器在线），可跳过本步直接跑脚本；cookie 读不到时脚本自动回退浏览器桥（见 1b），那时才需要浏览器在线并已注入 agent。
-
-### 1. 判据永远来自脚本，不要肉眼猜
+## 1. 先运行闸门，判据来自服务端
 
 ```bash
-python3 <skill目录>/scripts/ensure_login.py
+python3 <skill目录>/scripts/ensure_login.py [--expect-company <用户给定公司>] [--expect-account <目标账号>]
 ```
 
-输出一个 JSON 对象，退出码：`0`=登录态有效（**直接结束，不要再打开登录页**）；`3`=需要干预（`reason` 为 `no-cookie` / `no-session` / `expired` / `wrong-account` / `wrong-company` / `company-unknown`）；`1`=脚本自身出错。只有退出码 3 才需要动手，并优先照抄 JSON 里的 `action` 文案。`no-session` 表示 cookie 库与浏览器桥两路都拿不到会话，按 `action` 指引起桥（1b）或登录（2）。
+- 退出码 `0`：登录态有效；有目标公司时必须带 `--expect-company` 并验证通过。直接继续原流程，不再打开登录页。
+- 退出码 `3`：需要恢复或核对。`no-cookie` / `no-session` 表示没有取得可用会话，**no-session 不等于未登录**；按下面固定恢复路线处理，不给“两条路任选”。
+- `expired`：服务端未确认有效，先检查自己新建的页面，不盲目填表。
+- `wrong-account` / `wrong-company`：服务端/账号核对不符，按第 4 节换号。
+- `company-unknown`：服务端公司查询失败，保留 `--expect-company` 重跑一次；仍失败停止原流程并请用户核对，不能把页面显示或人工核对当作服务端验证通过。
+- 退出码 `1`：脚本错误，按脱敏诊断排查，不假定未登录。
 
-**用户给了公司名称就一定要校验**（用户通常发简称，如「埔鸣」；接口返回全称如「义乌市埔鸣日用品有限公司」，脚本按互相包含匹配）：
+用户给公司名就必须始终传 `--expect-company`，允许简称与全称互相包含。手机号（11 位数字）只与 accountInfo 的脱敏 `erpMobile` 比对，不与 scm cookie 提示混比。非手机号与 cookie `accountHint` 比对；无法比较时 `accountCheck: unverified` 不阻断，但不能代替公司验证。
 
-```bash
-python3 <skill目录>/scripts/ensure_login.py --expect-company 埔鸣
-```
+## 2. 固定恢复路线：新建自己的页 → 判断 → 必要时登录 → 源码桥接 → 服务端验证
 
-**身份以公司名称为准，不以登录手机号为准**：同一公司可以有多个手机号登录；`erpMobile` 仅为平台返回的 ERP 绑定信息（手机号），不是当前实际登录手机号，不能用于认定实际登录身份。用户提供的登录手机号只用于需要登录时填表，**不得自动变成 `--expect-account` 身份约束**。
+### 2.1 当前浏览器中新建自己的 Magpie 标签页
 
-- 公司先校验：不匹配 → `wrong-company`；公司名查不到 → `company-unknown`。即使手机号相同、或账号不可核对，也不得放行；保留原公司简称/全称匹配规则。
-- 默认只传 `--expect-company`。显式给了 `--expect-account` 且公司已匹配时，账号不匹配仅输出 `accountCheck: mismatch-ignored-company-match`，仍成功，不要求退出/换号。
-- 用户**明确要求严格核对特定账号**时，同时传 `--expect-account <账号提示> --strict-account`；可比账号不匹配 → `wrong-account`。仅给 `--strict-account` 不给账号是参数错误。
-- 没有 `--expect-company` 时，显式 `--expect-account` 保持原账号单独核对行为（可比不符即阻断）。
-- 严格/单独账号核对的比对来源不变：11 位手机号与 `accountInfo.erpMobile` 脱敏串比较；非手机号与 cookie `accountHint` 比较。缺失可比证据仍是 `unverified`，不将未知当作已确认匹配；公司校验绝不因此跳过。
+1. 仅使用 magpie-browser MCP 的 `browser`。先 `browsers`，多浏览器时用 `use_browser` 选定用户当前浏览器，之后不切换。
+2. 无连接时提示用户打开原浏览器并启用 Magpie 扩展，等待用户完成；**不得自行新开浏览器实例或 profile**，不使用 chrome-devtools 或 browser-skill 的另开窗口路线。
+3. **每次恢复开始一律 `tab_new` 新建自己的 Magpie 标签页**，URL 为 `https://tgc.tmall.com/ds/page/supplier/home`。记录返回 tab，后续操作显式传该 tab；同一次恢复后续判断、登录、换号、注入与重试继续用这个自己新建的页，不是每步再开一个。
+4. 不复用、不导航、不注入用户已有标签页、其他 agent 的 `~` 标签页、旧登录页或旧淘工厂页；不能先找一个已登录旧标签来注入。
 
-```bash
-# 常规：只按目标公司验证；不要自动附加用户登录手机号
-python3 <skill目录>/scripts/ensure_login.py --expect-company 埔鸣
-# 只有用户明确要求严格账号核对时
-python3 <skill目录>/scripts/ensure_login.py --expect-company 埔鸣 --expect-account <指定账号> --strict-account
-```
+### 2.2 先判断页面，只有确认未登录才填表
 
-`tmall_token.py` 使用完全相同的公司优先/显式严格账号策略与参数。
+对自己新建的页 `snapshot`：
+- 若已登录并处于 `https://tgc.tmall.com`，**直接进入 2.3 桥接，不要填表或重新登录**。
+- 若明确跳到登录页/显示登录表单，才在自己页打开 `https://tgcwork.tmall.com/login` 并执行以下填表步骤。
+- 若页面加载异常、无明确状态，继续 snapshot/排查，不因 no-session 就认定未登录或索要密码。
 
-### 1b. cookie 库读不到时：起浏览器桥（`reason: no-session`）
+填表步骤：
+1. 用 snapshot 的 ref 定位 iframe 表单，只检查账号、密码“是否有值”的布尔状态，不读出/回显密码。已有预填保留；缺账号时只补用户本轮给定的账号，然后再次检查密码是否有值，避免覆盖账号输入后触发的浏览器自动填充；仅补仍缺失的字段。
+2. 两字段均有值后 `click` 真实登录按钮，不用 evaluate 合成点击。填表用 `type` 按 ref，只用用户本轮提供的凭据，不从密码管理器、系统凭据库、其他脚本挖密码。无可用凭据时 `ask_user_question` 只问一次并记录等待项（不含秘密），结束回复等待；无新输入或新会话证据不重复催问或提交。
+3. 滑块、短信、验证码、二次验证都停下来让用户人工完成，绝不绕过。
+4. 密码错误提示用户并索要正确密码，最多重试 2 次；账号不存在/停用/冻结/失效则停止，不盲重试。页面无错误且未跳转则再 snapshot 排查。
+5. 登录后在**自己的同一标签页**进入 `https://tgc.tmall.com/ds/page/supplier/home`，继续桥接。页面跳转不是最终成功。
 
-Windows 上 Edge 正在运行会把 cookie 库锁死（`immutable` 直读也失败）、新版 Chrome 的 v20 应用绑定加密无法离线解密——这些环境下 `--transport auto`（默认）会在 cookie 路线失败后自动回退**浏览器桥**。桥不可用时 `ensure_login.py` 返回 `no-session`，`action` 文案就是下面两步：
+### 2.3 本 skill 自带桥：read 源码并 evaluate 直接执行
 
-1. **后台起桥**（本 skill 自带，无第三方依赖；已在跑会自动复用）：
+1. 后台启动本 skill 的桥（使用受管理后台任务并记录 job id；已运行则复用服务）：
 
    ```bash
    python3 <skill目录>/scripts/browser_bridge.py --port 8899
    ```
 
-2. **注入 agent**：用 magpie-browser 找一个**已登录淘工厂的标签页**（如 `https://tgc.tmall.com/ds/page/supplier/home`；没有就先走第 2 步登录，登录完的标签页正好可用），对该标签执行 `evaluate`：
+2. **直接用 read 工具读取 `<skill目录>/scripts/bridge_agent.js` 的完整源码**，然后将读到的整段源码原样交给 magpie-browser 的 `evaluate`，显式传自己新建的 tab。该页必须是 `https://tgc.tmall.com` 源站。
+3. 固定使用上述源码执行，不使用 `<script src=...>` 注入，也不从其他 skill 查找脚本。源码是 IIFE，直接执行即可，不需改写逻辑。导航、刷新或换号后需重新 read 并 evaluate。
+4. `bridge agent started` / `already running` 仅说明注入执行，不是登录成功；桥 ready、连接状态、`transport: bridge` 或 `erpMobile` 有值也都不代替服务端验证。桥只监听 127.0.0.1，任务与响应内存流转，浏览器自动附带 HttpOnly cookie。
 
-   ```js
-   () => { const s = document.createElement('script'); s.src = 'http://127.0.0.1:8899/agent.js'; document.head.appendChild(s); return 'agent injected'; }
-   ```
+### 单一有效桥连接边界
 
-   随后重跑 `ensure_login.py`，JSON 里 `transport: "bridge"` 且登录态有效即桥路生效（有目标公司时必须公司匹配，不要求 `erpMobile` 有值）。桥只监听 127.0.0.1，凭据内存流转不落盘。
+- 淘工厂8899与ERP8901各自独立，每种桥只允许一个有效页面代理；恢复前先确认没有业务调用在运行。只关闭自己记录且已不再承载业务的旧桥标签，不关闭用户或其他agent标签。
+- 导航、刷新或换号后旧页代理失效，需要重新注入并服务端验证；新代理不能抢占仍活跃的旧代理。遇到代理冲突时先核对自己旧页，必要时关闭自己的旧页并等待旧连接过期，不循环开页或重启业务任务。
+- 桥连通仅证明连接，不证明公司身份；淘工厂必须验证目标公司，ERP不得擅自换账号或套用淘工厂同名约束。
+- 桥协议代码更新不会热更新已运行的Python桥或已注入脚本。业务空闲时才重启自己管理的桥、刷新自己的旧桥页面以终止旧循环，再重新注入新版脚本；新版服务拒绝无agentId的旧脚本（409），但旧脚本本身可能持续重试，不能只重复注入。旧服务缺少绑定字段时新版客户端会停止提示升级。不杀未知进程，不为升级重跑历史账单。
 
-### 2. 登录动作（仅退出码 3 时）
-
-1. **当前已打开的浏览器 + 新开 Magpie 标签页**：绝不新开浏览器、不新建 profile，也不要用 browser-skill 的 bsk_*（Agent Window 会另开浏览器窗口）。只用 magpie-browser MCP 的 `browser` 工具接管用户**当前已经打开**的那个浏览器（多浏览器时先 `browsers` 再 `use_browser` 选定，之后不换）。登录动作**一律 `tab_new` 新开一个 Magpie 标签页**（带 url `https://tgcwork.tmall.com/login`），**不复用任何已有标签页**：用户自己的标签、`tabs` 里带 `~`（其他 agent 在用）的标签、旧的 tgcwork 登录页标签都不要动。也不要用 chrome-devtools。登录完成并验证通过后，可 `tab_close` 关闭自己开的这个标签页。
-2. **判断登录框状态**：`snapshot`（interactive）读登录页 iframe，里面应有「请输入账号名/手机号/邮箱」「请输入登录密码」「登录」三个元素。
-   - 两个输入框都已有值（用户或密码管理器预填）→ 直接进入第 4 步，**不要改动内容**。
-   - 输入框为空 → 进入第 3 步。
-3. **凭据来源只有两个，都不落盘**：用户在本轮对话里已给出账号/密码就用它；否则用 `ask_user_question` 问一次（账号 + 密码），说明只用于本次填表。**绝不把密码写进技能文件、状态文件、日志或回复**；**绝不从系统凭据管理器、浏览器保存密码或其他脚本里挖密码**。
-4. 用 `type` 按 ref 填表，再用 `click` 点「登录」按钮（真实点击，不要用 `evaluate` 合成点击）。
-5. **登录要验证，不能假定成功**：
-
-   ```bash
-   python3 <skill目录>/scripts/ensure_login.py --wait 30 [--expect-company 埔鸣]
-   ```
-
-   轮询到 `loggedIn: true`（退出码 0）才算成功。
-
-### 3. 登录失败的处理（分类，不盲目重试）
-
-点完「登录」后等 2~3 秒 `snapshot` 一次，按页面状态分流；`ensure_login.py --wait` 轮询结束仍不是 0 时也走这里：
-
-| 页面表现 | 判定 | 处理 |
-|---|---|---|
-| 出现滑块/拖动验证（iframe 里有「滑动验证」「请按住滑块拖动」等字样） | 人机验证 | **停下来提示用户**：「登录页出现滑块验证，请在浏览器里手动滑动完成验证」，等用户完成后重跑 `ensure_login.py --wait 30` 继续。**绝不尝试自动绕过验证码** |
-| 提示「账号名或登录密码错误」「密码错误」等 | 密码错 | **提示用户密码错误**，用 `ask_user_question` 要正确密码，重新填表登录，最多重试 2 次；用户也改不了就停止 |
-| 提示「账号不存在」「账号已停用/冻结/失效」等 | 账号失效 | **提示用户该账号已失效**，让用户确认账号状态或换账号，不要重试 |
-| 提示需要短信验证码 | 二次验证 | 停下来让用户在浏览器里自己输，完成后重跑 `ensure_login.py --wait 30` |
-| 页面无任何错误提示、也没跳转 | 未知 | 重跑 `ensure_login.py --wait 30` 一次；仍失败则 `snapshot` 人工判断 |
-
-登录成功但 `reason` 为 `wrong-company`：说明登录的账号不属于用户给的公司 → 在自己新开的那个 Magpie 标签页里打开 tgc.tmall.com 退出登录（右上角公司名 → 退出），再按第 2 步重新登录（又是新开一个 Magpie 标签页）换目标公司的账号。
-
-若用户明确要求“不要自动登录”，则只提示用户在浏览器里登录一次后重试。除此之外，只有遇到短信/滑块等验证码时才需要人工介入。
-
-### 4. 获取 token
+### 2.4 服务端验证才是成功标准
 
 ```bash
-python3 <skill目录>/scripts/tmall_token.py                              # 只拿 token + 账号提示
-python3 <skill目录>/scripts/tmall_token.py --with-headers               # 附带完整请求头（含 cookie）
-python3 <skill目录>/scripts/tmall_token.py --with-headers --expect-company 埔鸣
+python3 <skill目录>/scripts/ensure_login.py --wait 30 [--expect-company <用户给定公司>] [--expect-account <目标账号>]
 ```
 
-退出码与 `ensure_login.py` 相同（0 有效 / 3 需登录或校验不过 / 1 出错）。成功输出示例：
+保留本次所有期望参数。有目标公司时必须通过服务端 accountInfo 公司校验且 `loggedIn: true`、退出码 `0` 才继续业务。页面右上角公司名、页面已登录或桥注入成功都不足以宣告成功。
 
-```json
-{ "ok": true, "reason": "logged-in", "accountHint": "scm65253097",
-  "company": "义乌市埔鸣日用品有限公司",
-  "cookieCount": 37, "xsrfToken": "…", "waitedSeconds": 0.4 }
+验证码人工完成、换号或页面导航后，同样先重新源码桥接再执行此验证。持续 no-session 排查桥/代理连接；不要反复填表。桥承载后续请求期间保留自己的标签页，不提前关闭；不再需要桥且业务结束时才可关闭自己创建的页，用户标签不动。
+
+## 3. 获取 token 与供其他 skill 引用
+
+```bash
+python3 <skill目录>/scripts/tmall_token.py [--expect-company <目标公司>]
+python3 <skill目录>/scripts/tmall_token.py --with-headers [--expect-company <目标公司>]
 ```
 
-调用天猫接口时用 `--with-headers` 拿到的 `headers` 直接作为请求头（已含 `cookie`、`x-xsrf-token`、UA、referer 等）。
+退出码同闸门。子进程 stdout JSON 可含 token/完整 headers，必须由调用进程直接捕获到内存并解析，不能回显到聊天或普通日志，不能重定向到文件。退出码 `3` 回到固定恢复路线。
 
-### 5. 供其他 skill 引用（cookie / token 复用）
+同一 Python 进程也可 import（这是调用接口，不是另一条登录恢复路线）：
 
-其他 skill（资产盘算、罚款导出等）需要天猫登录态时，按以下**任一**方式引用，凭据全程只在内存：
+```python
+import sys
+sys.path.insert(0, "<skill目录>/scripts")
+import tmall_session
+built = tmall_session.build_session()  # auto: cookie -> bridge
+headers, session = built["headers"], built["session"]
+ok = tmall_session.check_session(headers, session)
+info = tmall_session.fetch_company(headers, session)
+company_ok = info["ok"] and tmall_session.company_matches("用户给定公司", info["company"])
+# ok 和 company_ok 均为 True 才继续目标公司业务；headers/session 仅在内存使用。
+```
 
-1. **子进程方式（推荐，语言无关）**：
+## 4. 账号或公司不符
 
-   ```bash
-   python3 <skill目录>/scripts/tmall_token.py --with-headers
-   ```
-
-   stdout 输出一个 JSON：`ok` / `reason` / `accountHint` / `company` / `cookieCount` / `xsrfToken` / `headers`（含 `cookie`、`x-xsrf-token`、`user-agent`、`referer`、`origin`、`content-type`）。调用方解析后直接发请求；退出码 3 表示先要走上面的登录流程。调用方使用 `subprocess.run(..., capture_output=True)` 在内存中解析 stdout，禁止将输出重定向到文件、日志或聊天。不要把凭据 JSON 直接接入占用 stdin 的 heredoc；不要在终端工具中直接展示 `--with-headers` 的输出。
-
-2. **import 方式（同 Python 进程）**：
-
-   ```python
-   import sys
-   sys.path.insert(0, "<skill目录>/scripts")
-   import tmall_session
-   built = tmall_session.build_session()          # {"headers", "session", "transport"}；transport 默认 auto（cookie→桥）
-   headers, session = built["headers"], built["session"]
-   ok = tmall_session.check_session(headers, session)   # bool（桥会话也要传 session）
-   hint = tmall_session.account_hint(headers)     # 账号提示（脱敏）
-   info = tmall_session.fetch_company(headers, session) # {"company": 全称, "erpMobile": 脱敏手机号, "ok": bool, "detail": str}
-   tmall_session.company_matches("埔鸣", info["company"])  # 公司名匹配（简称↔全称）
-   tmall_session.account_verdict("13128826864", info["erpMobile"], hint)  # 仅账号证据，不代替公司校验；公司匹配默认不据此阻断
-   ```
-
-**红线**：`headers` / `xsrfToken` / cookie 只在调用方进程内存里用，不写入任何文件、日志、状态或聊天回复；需要展示时只给 `accountHint`、`company`、`cookieCount` 这类脱敏字段。
+`wrong-account` / `wrong-company` 不能忽略。若本次恢复还没创建自己的页，先新建自己的 Magpie 标签页；若已创建则继续用该页（不得操作旧用户页）。退出会影响同 profile 的其他标签会话，按以下边界处理：
+- **按顺序自动切换（用户固定偏好）**：用户已给出目标公司顺序及对应凭据时，服务端确认当前公司不是本轮目标公司，自动在自己的Magpie标签真实退出并登录本轮目标公司，**不用再次询问**；开始执行时登录了其他公司也适用。多公司必须严格串行，前一家公司全部完成后才进入下一家，不能跳过失败公司。
+- 公司身份未知时先核验，不能把 no-session 当作已确认公司不符而盲目退出；目标不明确、账号不明或要登录用户清单外目标时停止核对。此自动切换授权不扩展为ERP换号、验证码处理或合单范围批准。
+满足相应授权后，只在自己页通过真实点击退出并登录目标账号，重新 read/evaluate 随 skill 源码，带原期望参数服务端验证通过才继续业务。
+用户明确不要自动登录时停止自动填表，请用户在自己新建的页登录；完成后仍需源码桥接与服务端验证。
 
 ## 安全红线
 
-- **凭据只在内存**：cookie、XSRF token、请求头绝不写入技能文件、文档、状态文件、普通日志或聊天回复。需要展示时只给 `accountHint`、`company`、`cookieCount`、`hasXsrf` 这类脱敏字段（公司名不是机密，页面右上角本来就在展示）。
-- 不落盘密码：账号密码只在表单里出现一次，不进任何文件。
-- 不绕过验证码：出现短信/滑块/二次验证时停下来让用户自己过。
-- 不新开浏览器实例、不新建 profile：永远接管用户当前已经打开的那个浏览器；浏览器动作一律在**新开的 Magpie 标签页**里做，不复用、不打扰用户或其他 agent 的标签页。
+- 密码、cookie、XSRF token、完整请求头不写文件/状态/文档/普通日志/聊天回复，仅在表单和进程内存中使用。只展示 `accountHint`、`company`、`cookieCount`、`hasXsrf` 等脱敏状态。
+- 不从浏览器保存密码、系统凭据或其他脚本提取密码；不得把含凭据的历史对话恢复到临时文件，事后删除也不允许。历史必要凭据仅在内存上下文读取；无法安全取得则请用户重新提供。验证码人工完成，不自动绕过。
+- 不新开浏览器或 profile，不修改加密安全设置；所有浏览器操作只在自己新建的 Magpie 标签页，不复用用户或其他 agent 标签。
+- 公司验证失败不继续业务，不以页面状态、桥连接、手机号字段代替服务端公司验证。
 
-## 依赖
+## 依赖与脚本
 
-- Python 3.11+，`cryptography`（AES-GCM/CBC 解密）。
-- macOS 无需额外依赖（`security` 命令读钥匙串）；Windows 无需 pywin32（ctypes 调 crypt32）。
-- 浏览器桥自包含：`scripts/browser_bridge.py` + `scripts/bridge_agent.js` 随本 skill 附带（纯标准库），不依赖任何其他 skill。
-- 优先使用当前带依赖的 Python。macOS 可用 `python3`；Windows 可用 `py -3` 或 DSH 自带 Python（基于当前用户路径，不限定 Administrator）。缺 `cryptography` 时用 `uv venv .venv --python 3.12` 建环境；macOS 安装：`uv pip install --python .venv/bin/python cryptography`，Windows 安装：`uv pip install --python .venv/Scripts/python.exe cryptography`，之后用对应解释器运行脚本。不要跨平台复制二进制依赖。
-- magpie-browser MCP（登录动作与 agent 注入用；纯检查/取 token 且 cookie 库可读时不需要浏览器在线）。
-
-## 已知限制
-
-- Chrome/Edge 启用 v20 应用绑定加密（App-Bound Encryption）的 profile 无法离线解密，会明确报错；此时用浏览器桥（`--transport bridge` 或默认 auto 回退）即可，无需换 profile。
-- Windows 上浏览器正在运行时 cookie 库可能被锁定——脚本先用 SQLite `immutable` 只读方式直读活库，失败才复制一份再读（支持 WAL）；再失败自动走桥，全程无需关闭浏览器。
-- `wrong-account` / `wrong-company` 场景需要先在浏览器里退出当前账号再登录目标账号；退出动作让用户确认后操作。
-- 公司名校验与手机号核对依赖 `https://tgc.tmall.com/api/v1/supplierHome/accountInfo` 接口；接口偶发异常时返回 `company-unknown`（或账号 `unverified`，不阻断），重跑即可。
-- 沙箱把 `%TEMP%` 拦掉时复制路线会失败——`immutable` 直读与桥都不经过临时目录，不受影响。
-
-## 脚本
+Python 3.11+；本机 cookie 解密需要 `cryptography`（macOS 钥匙串、Windows ctypes DPAPI 无需 pywin32）。桥是纯标准库，随本 skill 提供，不依赖其他 skill。magpie-browser 仅在浏览器恢复/注入时需要。
 
 | 脚本 | 作用 |
 |---|---|
-| `scripts/ensure_login.py` | 登录态闸门（唯一判据来源，含 `--wait` / `--expect-account` / `--strict-account` / `--expect-company` / `--transport` / `--bridge-url`） |
-| `scripts/tmall_token.py` | 获取 XSRF token / 完整请求头（含 `--with-headers` / `--expect-account` / `--strict-account` / `--expect-company` / `--transport` / `--bridge-url`） |
-| `scripts/tmall_session.py` | 跨平台 cookie 解密与会话构建（macOS 钥匙串 / Windows DPAPI；`build_session` 支持 cookie→桥自动回退），供其他 skill import |
-| `scripts/browser_bridge.py` | 浏览器桥服务（127.0.0.1:8899，纯标准库，配合 magpie 注入 agent 使用） |
-| `scripts/bridge_agent.js` | 注入到已登录 tgc 标签页的桥 agent（由 browser_bridge.py 托管在 `/agent.js`） |
+| `scripts/ensure_login.py` | 登录态闸门与恢复提示，支持 wait、公司/账号、transport/bridge-url |
+| `scripts/tmall_token.py` | token/完整 headers，调用进程只在内存捕获 |
+| `scripts/tmall_session.py` | cookie 解密、会话构建与服务端登录/公司校验；auto 回退桥 |
+| `scripts/browser_bridge.py` | 127.0.0.1:8899 桥服务 |
+| `scripts/bridge_agent.js` | 用 read 读取完整源码，再于自己 tgc 页 evaluate 直接执行 |

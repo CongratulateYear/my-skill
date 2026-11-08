@@ -141,9 +141,10 @@ class ExportTests(unittest.TestCase):
         url = j.poll_export(session, {}, "12", sleep=lambda _: None)
         self.assertTrue(url.endswith("file.xlsx"))
         polls = [c for c in session.calls if c[0] == "post"][2:]
-        self.assertEqual(polls[0][2]["data"]["__VIEWSTATE_DEL"], "dynamic-state")
-        self.assertEqual(polls[0][2]["data"]["__VIEWSTATE"], "")
-        self.assertEqual(polls[0][2]["data"]["__CALLBACKID"], "ACall1")
+        self.assertEqual(polls[0][2]["data"]["__VIEWSTATE"], "dynamic-state")
+        self.assertNotIn("__VIEWSTATE_DEL", polls[0][2]["data"])
+        self.assertEqual(polls[0][2]["data"]["__CALLBACKID"], "JTable1")
+        self.assertEqual(json.loads(polls[0][2]["data"]["__CALLBACKPARAM"])["Method"], "CheckAndGetExportData")
         self.assertEqual(json.loads(polls[0][2]["data"]["__CALLBACKPARAM"])["Args"], ["12"])
 
     def test_task_status_not_guessed_and_configurable(self):
@@ -193,7 +194,10 @@ class ExportTests(unittest.TestCase):
                               ("fake.xlsx", b"not zip"), ("bomb.xlsx", b"0" * 100000)):
             b = io.BytesIO()
             with zipfile.ZipFile(b, "w", zipfile.ZIP_DEFLATED) as z:
-                z.writestr(name, content)
+                info = zipfile.ZipInfo(name)
+                info.filename = name  # Keep malicious backslash fixture on Windows.
+                info.compress_type = zipfile.ZIP_DEFLATED
+                z.writestr(info, content)
             with self.assertRaises(j.ExportError):
                 j.validate_archive(b.getvalue())
         with self.assertRaises(j.ExportError):
@@ -225,9 +229,10 @@ class ExportTests(unittest.TestCase):
 
     def test_unpack_unique_and_preserve_zip(self):
         bundle = io.BytesIO()
+        expected = xlsx()  # ZIP member timestamps vary across separately built fixtures.
         with zipfile.ZipFile(bundle, "w") as archive:
-            archive.writestr("a/report.xlsx", xlsx())
-            archive.writestr("b/report.xlsx", xlsx())
+            archive.writestr("a/report.xlsx", expected)
+            archive.writestr("b/report.xlsx", expected)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "original.zip"
             path.write_bytes(bundle.getvalue())
@@ -235,7 +240,7 @@ class ExportTests(unittest.TestCase):
             second = j.unpack_export(path)
             self.assertEqual(len(first), 2)
             self.assertNotEqual(first[0].parent, second[0].parent)
-            self.assertEqual(first[0].read_bytes(), xlsx())
+            self.assertEqual(first[0].read_bytes(), expected)
             self.assertTrue(path.exists())
             self.assertEqual(j.unpack_export(first[0]), [first[0]])
             with self.assertRaises(j.ExportError):

@@ -729,21 +729,15 @@ def target_amount_header(target: str, headers: list[str]) -> str | None:
 
 
 def recalculate_with_libreoffice(output: Path, fixed_headers: list[Any]) -> bool:
-    """Re-save through LibreOffice when available so formula results are cached.
+    """Explicit Kit recalculation; publish verified caches into the original package.
 
-    Failure is non-fatal: Excel calculation flags are already set and the
-    original openpyxl output remains intact.
+    Never invoke system soffice or silently present stale caches as calculated.
     """
-    configured = os.environ.get("SOFFICE_PATH")
-    candidates = [
-        Path(configured).expanduser() if configured else None,
-        Path('D:\\dsh\\resources\\app.asar.unpacked\\dsh\\node_modules\\@deepseek-ai\\libreoffice-kit-win32-x64\\program\\program\\soffice.exe'),
-        Path(shutil.which("soffice")) if shutil.which("soffice") else None,
-        Path(shutil.which("libreoffice")) if shutil.which("libreoffice") else None,
-    ]
-    soffice = next((p.resolve() for p in candidates if p and p.exists()), None)
-    if soffice is None:
-        return False
+    # Explicit recalculation only: never discover or invoke a system soffice.
+    node = Path(os.environ.get("DSH_OFFICE_NODE", r"D:\dsh\resources\runtime\primary-runtime\dependencies\node\bin\node.exe"))
+    cli = Path(os.environ.get("DSH_OFFICE_CLI", r"D:\dsh\resources\app.asar.unpacked\dsh\node_modules\@deepseek-ai\libreoffice-kit\lib\cli.js"))
+    if not node.is_file() or not cli.is_file():
+        raise RuntimeError("LibreOffice Kit unavailable; formula caches were not refreshed")
     try:
         with tempfile.TemporaryDirectory(prefix="pan_suan_recalc_", dir=output.parent) as temp_name:
             temp = Path(temp_name)
@@ -753,8 +747,9 @@ def recalculate_with_libreoffice(output: Path, fixed_headers: list[Any]) -> bool
             result_dir.mkdir()
             source = source_dir / output.name
             shutil.copy2(output, source)
+            candidate = result_dir / output.name
             completed = subprocess.run(
-                [str(soffice), "--headless", "--convert-to", "xlsx", "--outdir", str(result_dir), str(source)],
+                [str(node), str(cli), "recalculate", "--input", str(source), "--output", str(candidate)],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -763,7 +758,7 @@ def recalculate_with_libreoffice(output: Path, fixed_headers: list[Any]) -> bool
             )
             candidate = result_dir / output.name
             if completed.returncode != 0 or not candidate.exists():
-                return False
+                raise RuntimeError("LibreOffice Kit failed to produce the recalculated workbook")
             validation = load_workbook(candidate, read_only=True, data_only=False)
             if "公司汇总" not in validation.sheetnames or "所有商品效果数据导出" not in validation.sheetnames:
                 validation.close()
@@ -772,10 +767,16 @@ def recalculate_with_libreoffice(output: Path, fixed_headers: list[Any]) -> bool
                 validation.close()
                 return False
             validation.close()
-            os.replace(candidate, output)
+            import importlib.util
+            cache_spec = importlib.util.spec_from_file_location("tgc_recalc_cache", Path(__file__).with_name("recalc_cache.py"))
+            cache_module = importlib.util.module_from_spec(cache_spec)
+            cache_spec.loader.exec_module(cache_module)
+            cached_output = temp / "cache_preserved.xlsx"
+            cache_module.transplant_caches(output, candidate, cached_output)
+            os.replace(cached_output, output)
             return True
-    except (OSError, subprocess.SubprocessError, TimeoutError, ValueError):
-        return False
+    except (OSError, subprocess.SubprocessError, TimeoutError, ValueError) as exc:
+        raise RuntimeError(f"LibreOffice Kit recalculation/validation failed; uncalculated workbook retained: {exc}") from exc
 
 
 def merge(
@@ -888,6 +889,12 @@ def merge(
 
     allocated_count, unassigned_count = rebuild_allocation_sheets(wb)
     product_count = rebuild_summary(wb, shop_name=shop_name)
+    import importlib.util
+    compatibility_path = Path(__file__).with_name("template_compat.py")
+    compatibility_spec = importlib.util.spec_from_file_location("tgc_template_compat", compatibility_path)
+    compatibility_module = importlib.util.module_from_spec(compatibility_spec)
+    compatibility_spec.loader.exec_module(compatibility_module)
+    compatibility_stats = compatibility_module.rebuild_legacy_helpers(wb)
     try:
         wb.calculation.fullCalcOnLoad = True
         wb.calculation.forceFullCalc = True

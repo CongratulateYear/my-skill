@@ -10,8 +10,9 @@ resulting cookie database):
 
 When the cookie store cannot be read (Windows v20 app-bound encryption, an
 Edge-exclusive Cookies file, or a sandbox that denies the temp area), the
-browser-bridge transport reuses the already-logged-in tgc.tmall.com tab
-instead: build_session(transport="auto") falls back to it automatically.
+browser-bridge transport uses the agent's newly-created own Magpie tab on
+ tgc.tmall.com instead (never a user's existing tab): build_session(transport="auto")
+falls back to it automatically.
 
 Credentials never leave memory: nothing is written to the skill directory,
 state files, or logs. Only non-secret diagnostics are printed (stderr).
@@ -50,12 +51,14 @@ XSRF_COOKIE_NAMES = ("XSRF-TOKEN", "X-XSRF-TOKEN")
 # Identity cookies, most reliable first; empty values are skipped.
 HINT_COOKIE_ORDER = ("tracknick", "lgc", "cookie17", "unb", "sn")
 
-_SCRIPT_DIR = str(Path(__file__).resolve().parent)
-if _SCRIPT_DIR not in sys.path:
-    sys.path.insert(0, _SCRIPT_DIR)
-import _bootstrap  # noqa: E402,F401  (adds the skill's vendored libraries)
+# DSH Windows: load vendored cryptography from the shared skill vendor dir
+_vendor = Path(__file__).resolve().parents[2] / '.vendor'
+if _vendor.is_dir():
+    for _p in (_vendor, *sorted(_vendor.glob('*.dist-info'))):
+        if str(_p) not in sys.path:
+            sys.path.append(str(_p))
 
-IS_WINDOWS = sys.platform.startswith("win") or os.name == "nt"
+IS_WINDOWS = sys.platform.startswith("win")
 
 # browser key -> {dir, label?, name, win_dir?}
 BROWSERS: dict[str, dict[str, str]] = {
@@ -76,12 +79,6 @@ BROWSERS: dict[str, dict[str, str]] = {
         "label": "Chrome Safe Storage",
         "name": "Google Chrome Beta",
         "win_dir": r"Google\Chrome Beta\User Data",
-    },
-    "chrome-canary": {
-        "dir": "Google/Chrome Canary",
-        "label": "Chrome Safe Storage",
-        "name": "Google Chrome Canary",
-        "win_dir": r"Google\Chrome SxS\User Data",
     },
     "brave": {
         "dir": "BraveSoftware/Brave-Browser",
@@ -109,15 +106,17 @@ class BridgeSessionError(SessionError):
 # Windows-only: where a logged-in Edge/Chrome keeps its cookies. Edge keeps the
 # SQLite file open exclusively while the browser runs, Chrome does not.
 WINDOWS_COOKIE_LOCK_HINT = (
-    "（Windows 上 Edge/Chrome 运行时会独占 cookie 数据库：若提示无法读取，"
-    "可改用浏览器桥传输，或在要读的那个浏览器里登录后完全退出该浏览器，"
-    "或换用另一个浏览器登录一次天猫）"
+    "（Windows 上 cookie 数据库可能被锁定；保持当前浏览器和 profile 不变，"
+    "按本 skill 固定路线新建自己的 Magpie 标签页，已登录直接桥接，未登录才填表；"
+    "read 本 skill 的 scripts/bridge_agent.js 源码并 evaluate 直接执行）"
 )
 
 
 def _user_data_root(browser: str) -> Path:
     if IS_WINDOWS:
-        local = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        local = os.environ.get("LOCALAPPDATA")
+        if not local:
+            raise SessionError("未设置 LOCALAPPDATA，无法定位浏览器用户数据目录")
         return Path(local) / BROWSERS[browser]["win_dir"]
     return Path.home() / "Library" / "Application Support" / BROWSERS[browser]["dir"]
 
@@ -144,7 +143,6 @@ def cookie_files(browser: str) -> list[Path]:
         if str(p) not in seen:
             seen.add(str(p))
             unique.append(p)
-    unique.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
     return unique
 
 
@@ -272,8 +270,9 @@ def _decrypt(encrypted: bytes, key: bytes, host: str) -> str:
     if prefix == b"v20":
         raise SessionError(
             "该浏览器的 cookie 使用 v20 应用绑定加密（App-Bound Encryption），本工具无法解密；"
-            "请改用浏览器桥传输（--transport bridge），或在浏览器设置里关闭应用绑定加密，"
-            "或换用未启用该加密的浏览器配置文件。" + (WINDOWS_COOKIE_LOCK_HINT if IS_WINDOWS else "")
+            "按本 skill 固定恢复路线走浏览器桥（--transport bridge）：新建自己的 Magpie 标签页，"
+            "已登录直接桥接，未登录才填表；read 本 skill 的 scripts/bridge_agent.js 源码并 evaluate "
+            "直接执行，不更改浏览器加密设置、不换 profile。" + (WINDOWS_COOKIE_LOCK_HINT if IS_WINDOWS else "")
         )
     return encrypted.decode("utf-8", "replace")
 
@@ -456,9 +455,14 @@ def build_headers(browser: str = "auto", domain: str = DEFAULT_DOMAIN) -> dict[s
             )
             return headers
     raise SessionError(
-        "未能在本机浏览器中找到可用的天猫登录态（浏览器里没有有效登录 cookie）。"
-        "请先在当前已打开的浏览器里打开 https://tgcwork.tmall.com/login 完成登录"
-        "（复用已有标签，没有才新开一个；不要新开浏览器实例，不要把密码落盘）。\n"
+        "未能从本机 cookie 库取得可用会话，不代表浏览器未登录。"
+        "固定恢复路线：在当前已打开的浏览器中 tab_new 新建自己的 Magpie 标签页，"
+        "不复用用户或其他 agent 标签，不新开浏览器或 profile；"
+        "打开 https://tgc.tmall.com/ds/page/supplier/home，已登录直接桥接，确认未登录才填表。"
+        "后台起本 skill 的 scripts/browser_bridge.py --port 8899，read 本 skill 的 "
+        "scripts/bridge_agent.js 源码并在自己 tgc 页 evaluate 直接执行，不插入 script src。"
+        "凭据不落盘、不回显，验证码人工完成；重跑 ensure_login.py，保留 --expect-company，"
+        "以服务端公司验证通过且退出码 0 为成功标准。\n"
         + "\n".join(f"- {item}" for item in errors)
     )
 

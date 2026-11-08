@@ -70,7 +70,7 @@ class MatchingTests(unittest.TestCase):
         backup = Path(result['backup'])
         self.assertNotIn(self.root, backup.parents)
         self.assertEqual(backup.read_bytes(), original)
-        self.assertEqual(sorted(p.name for p in self.root.iterdir()), ['原处罚数据.xlsx', '原处罚数据.xlsx.lock', '聚水潭订单.xlsx'])
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), ['原处罚数据.xlsx', '聚水潭订单.xlsx'])
         wb = load_workbook(self.fine)
         self.assertEqual(wb.sheetnames, ['处罚数据', '保留页'])
         self.assertEqual(wb['处罚数据'].max_column, 3)
@@ -320,7 +320,12 @@ class MatchingTests(unittest.TestCase):
         self.fixtures()
         original = self.fine.read_bytes()
         alias = self.root / 'alias.xlsx'
-        alias.symlink_to(self.fine)
+        try:
+            alias.symlink_to(self.fine)
+        except OSError as exc:
+            if getattr(exc, 'winerror', None) == 1314:
+                self.skipTest('Windows symlink privilege unavailable')
+            raise
         with self.assertRaises(m.MatchError):
             m.match_fines(alias, [self.order], '店', 'fine-export')
         with self.assertRaises(m.MatchError):
@@ -360,7 +365,7 @@ class MatchingTests(unittest.TestCase):
             with self.assertRaisesRegex(OSError, 'synthetic reopen failure'):
                 self.match()
         self.assertEqual(self.fine.read_bytes(), original)
-        self.assertEqual(sorted(p.name for p in self.root.iterdir()), ['原处罚数据.xlsx', '原处罚数据.xlsx.lock', '聚水潭订单.xlsx'])
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), ['原处罚数据.xlsx', '聚水潭订单.xlsx'])
 
     def test_write_and_replace_failure_original_intact(self):
         self.fixtures()
@@ -373,10 +378,10 @@ class MatchingTests(unittest.TestCase):
             with self.assertRaisesRegex(OSError, 'synthetic replace failure'):
                 self.match()
         self.assertEqual(self.fine.read_bytes(), original)
-        backups = list((self.base / '.jst-fine-backups').iterdir())
+        backups = list(m._backup_directory(self.fine, None).iterdir())
         self.assertEqual(len(backups), 1)
         self.assertEqual(backups[0].read_bytes(), original)
-        self.assertEqual(sorted(p.name for p in self.root.iterdir()), ['原处罚数据.xlsx', '原处罚数据.xlsx.lock', '聚水潭订单.xlsx'])
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), ['原处罚数据.xlsx', '聚水潭订单.xlsx'])
 
     def test_conflicting_backup_is_never_overwritten(self):
         self.fixtures()

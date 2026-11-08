@@ -46,6 +46,30 @@ class ValidationTest(unittest.TestCase):
         self.main = Path(self.tmp.name) / 'main.xlsx'
         b.merge(TEMPLATE, [self.fine], self.main, strict=True, shop_name='公司')
 
+    def test_error_scan_is_exact_without_materializing_blank_rectangle(self):
+        from collections import Counter
+        wb = Workbook()
+        self.addCleanup(wb.close)
+        ws = wb.active
+        ws.title = 'sparse'
+        ws['A1'] = '#DIV/0!'
+        ws['C3'] = '=SUM(#REF!,1)'
+        ws['G7'] = 'literal #ref! text'
+        ws.cell(20000, 30).number_format = '@'
+        count = len(ws._cells)
+        expected = Counter({('sparse', '#DIV/0!'): 1, ('sparse', '=SUM(#REF!,1)'): 1,
+                            ('sparse', 'literal #ref! text'): 1})
+        self.assertEqual(v._errors(wb), expected)
+        self.assertEqual(len(ws._cells), count)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'sparse.xlsx'
+            wb.save(path)
+            streamed = load_workbook(path, read_only=True, data_only=False)
+            try:
+                self.assertEqual(v._errors(streamed), expected)
+            finally:
+                streamed.close()
+
     def test_builder_english_directory_fallback(self):
         root = Path(self.tmp.name) / 'english-install'
         scripts = root / 'taogongchang-pansuan' / 'scripts'
@@ -53,6 +77,8 @@ class ValidationTest(unittest.TestCase):
         merge_scripts = root / 'taogongchang-merge' / 'scripts'
         merge_scripts.mkdir(parents=True)
         shutil.copyfile(ROOT / '淘工厂合并/scripts/pan_suan_builder.py', merge_scripts / 'pan_suan_builder.py')
+        shutil.copyfile(ROOT / '淘工厂合并/scripts/template_compat.py', merge_scripts / 'template_compat.py')
+        shutil.copyfile(ROOT / '淘工厂合并/scripts/recalc_cache.py', merge_scripts / 'recalc_cache.py')
         with patch.object(v, '__file__', str(scripts / 'inventory_validation.py')):
             self.assertEqual(v._builder().SUMMARY_REQUIRED_HEADERS, b.SUMMARY_REQUIRED_HEADERS)
             self.assertTrue(v.validate_inventory(self.main, '公司', self.folder, TEMPLATE)['ok'])

@@ -126,10 +126,15 @@ def _builder():
 def _errors(wb):
     errors = Counter()
     for ws in wb.worksheets:
-        for row in ws:
-            for cell in row:
-                if cell.data_type == 'e' or (isinstance(cell.value, str) and '#REF!' in cell.value.upper()):
-                    errors[(ws.title, str(cell.value))] += 1
+        # Normal worksheets already contain every parsed XML cell in _cells.
+        # Iterating the bounding rectangle materializes styled/empty padding and
+        # can create millions of new blank Cells; missing cells cannot be errors.
+        # Keep the streaming fallback for callers supplying read-only workbooks.
+        cells = (ws._cells.values() if hasattr(ws, '_cells')
+                 else (cell for row in ws for cell in row))
+        for cell in cells:
+            if cell.data_type == 'e' or (isinstance(cell.value, str) and '#REF!' in cell.value.upper()):
+                errors[(ws.title, str(cell.value))] += 1
     return errors
 
 

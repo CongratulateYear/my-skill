@@ -15,8 +15,8 @@
 - 输出目录默认：方式2=公司导出文件夹的父目录（主表与原始文件夹并列）；方式1=第一个文件所在目录。
 - 公司名称写入「公司汇总」店铺列。
 
-纯本地合并，不联网、不需要登录态。默认用 LibreOffice 计算公式缓存
-（--no-recalculate 关闭；机器上没有 soffice 时自动跳过，Excel 打开时计算）。
+纯本地合并，不联网、不需要登录态。默认不刷新公式缓存；
+--recalculate 显式使用 LibreOffice Kit，--no-recalculate 保留兼容，不调用系统soffice。
 默认从干净模板重建（幂等）；--accumulate 在已有输出上续并（保留手工列）。
 """
 from __future__ import annotations
@@ -265,8 +265,8 @@ def main() -> int:
     p.add_argument("--accumulate", action="store_true",
                    help="输出文件已存在时在其基础上续并（保留公司汇总手工列）；默认从干净模板重建")
     p.add_argument("--strict", action="store_true", help="遇到无法识别的 xlsx 直接失败（默认跳过并提示）")
-    p.add_argument("--no-recalculate", action="store_true",
-                   help="不用 LibreOffice 计算公式缓存（默认计算，无 soffice 时自动跳过）")
+    p.add_argument("--recalculate", action="store_true", help="显式使用 LibreOffice Kit 刷新缓存（不调用系统soffice）")
+    p.add_argument("--no-recalculate", action="store_true", help="保留兼容：禁用缓存刷新（默认不刷新）")
     args = p.parse_args()
 
     settlement = normalize_settlement(args.settlement_date)
@@ -280,7 +280,7 @@ def main() -> int:
 
     result = run_builder(
         sources, out_path, args.company_name,
-        accumulate=args.accumulate, strict=args.strict, recalculate=not args.no_recalculate,
+        accumulate=args.accumulate, strict=args.strict, recalculate=args.recalculate and not args.no_recalculate,
     )
     report(result)
     print(f"\n合并完成：{result.get('output', str(out_path))}")

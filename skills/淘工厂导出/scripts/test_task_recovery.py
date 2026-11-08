@@ -1,0 +1,200 @@
+"""Offline mock-only task recovery tests; fixtures stay inside this skill."""
+import argparse
+import copy
+import json
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import patch
+
+import tmall_bill_download as bill
+
+
+class RecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=Path(__file__).parent)
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.dates = {"orderPayTime": {"start": "2026-01-01", "end": "2026-01-31"}}
+        self.args = argparse.Namespace(
+            resume=False, _task_state={"taskJournalVersion": 1},
+            _task_state_file=self.root / "state.json", output_dir=self.root,
+            no_pan_suan=True, max_wait_seconds=0, poll_seconds=0)
+        # Network is prohibited even if a future regression bypasses a mock.
+        self.network = patch('urllib.request.OpenerDirector.open', side_effect=AssertionError('network forbidden'))
+        self.network.start()
+        self.addCleanup(self.network.stop)
+
+    def reload(self):
+        self.args._task_state = bill.load_resume_state(self.args._task_state_file)
+        self.args.resume = True
+
+    def create(self, response=None):
+        return bill.create_tracked_task(self.args, 'product-loan', self.dates, 7,
+                                       lambda: response or {'taskId': 'DB_123'})
+
+    def execute(self, key='product-loan'):
+        return bill.execute_module(self.args, None, {}, key, self.dates,
+                                   self.root / 'unused.xlsx', False, False)
+
+    def test_main_failure_resume_and_completed_publication_contract(self):
+        argv = ['download', '--module', 'product-loan', '--shop-name', 'synthetic-company',
+                '--expect-company', 'synthetic-company', '--no-pan-suan',
+                '--order-pay-start', '2026-01-01', '--order-pay-end', '2026-01-31',
+                '--write-off-start', '2026-01-01', '--write-off-end', '2026-01-31',
+                '--output-dir', str(self.root), '--state-file', str(self.args._task_state_file)]
+        calls = []
+        def post(session, url, headers, payload):
+            calls.append(url.rsplit('/', 1)[1])
+            if url.endswith('/queryBillDetail'):
+                return 200, {'paginator': {'total': 7}}
+            if url.endswith('/download/download'):
+                return 200, {'taskId': 'DB_123'}
+            if url.endswith('/pageQueryDownloadTask'):
+                return 200, {'taskId': 'DB_123', 'status': 'SUCCESS'}
+            if url.endswith('/getDownloadUrl'):
+                return 200, {'fileUrl': 'https://offline.invalid/signed'}
+            self.fail(url)
+        with patch.object(bill.sys, 'argv', argv), patch.object(bill, 'load_browser_headers', return_value=({}, None)), patch.object(bill, 'validate_company'), patch.object(bill, 'post', side_effect=post), patch.object(bill, 'download_and_extract', side_effect=OSError('download interrupted')):
+            with self.assertRaises(OSError):
+                bill.main()
+        disk = bill.load_resume_state(self.args._task_state_file)
+        self.assertEqual(disk['remoteTasks']['product-loan']['taskId'], 'DB_123')
+        self.assertEqual(disk['completedModules'], [])
+        calls.clear()
+        file = self.root / 'fixture.xlsx'
+        file.write_bytes(b'synthetic')
+        with patch.object(bill.sys, 'argv', argv + ['--resume']), patch.object(bill, 'load_browser_headers', return_value=({}, None)), patch.object(bill, 'validate_company'), patch.object(bill, 'post', side_effect=post), patch.object(bill, 'download_and_extract', return_value=([file], [])):
+            self.assertEqual(bill.main(), 0)
+        self.assertEqual(calls, ['pageQueryDownloadTask', 'getDownloadUrl'])
+        disk = bill.load_resume_state(self.args._task_state_file)
+        self.assertEqual(disk['completedModules'], ['product-loan'])
+        self.assertEqual(disk['results']['product-loan']['status'], 'completed')
+        self.assertEqual(disk['results']['product-loan']['publishFiles'], [str(file.resolve())])
+        self.assertNotIn('signed', self.args._task_state_file.read_text(encoding='utf-8'))
+        completed = copy.deepcopy(disk['results'])
+        with patch.object(bill.sys, 'argv', argv + ['--resume']), patch.object(bill, 'load_browser_headers', return_value=({}, None)), patch.object(bill, 'validate_company'), patch.object(bill, 'post', side_effect=AssertionError('completed must not request')):
+            self.assertEqual(bill.main(), 0)
+        self.assertEqual(bill.load_resume_state(self.args._task_state_file)['results'], completed)
+        disk['completedModules'] = []
+        disk['remoteTasks']['product-loan']['phase'] = 'creating'
+        bill.save_state(self.args._task_state_file, disk)
+        with patch.object(bill.sys, 'argv', argv + ['--resume']), patch.object(bill, 'load_browser_headers', side_effect=AssertionError('must not load credentials')), self.assertRaisesRegex(RuntimeError, '禁止自动重建'):
+            bill.main()
+
+    def test_task_id_boundary(self):
+        for bad in (None, True, 123, '', ' a', '../a', 'a/b', 'a?b', 'a\n', 'a' * 129):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                bill.validate_task_id(bad)
+        self.assertEqual(bill.find_task_id({'data': {'taskId': 'DB_123'}}), 'DB_123')
+        with self.assertRaises(ValueError):
+            bill.find_task_id({'taskId': 'a', 'nested': {'taskId': 'b'}})
+        self.assertIsNone(bill.find_task_id({'message': 'DB_123'}))
+        with self.assertRaises(ValueError):
+            bill.download_and_extract('https://offline.invalid', self.root, '../a')
+
+    def test_intent_precedes_create_and_id_immediately_persists(self):
+        def create():
+            disk = json.loads(self.args._task_state_file.read_text(encoding='utf-8'))
+            self.assertEqual(disk['remoteTasks']['product-loan']['phase'], 'creating')
+            return {'taskId': 'DB_123'}
+        bill.create_tracked_task(self.args, 'product-loan', self.dates, 7, create)
+        self.reload()
+        self.assertEqual(bill.resume_task(self.args, 'product-loan', self.dates)['taskId'], 'DB_123')
+        self.assertNotIn('https', self.args._task_state_file.read_text(encoding='utf-8'))
+
+    def test_resume_polls_downloads_existing_without_query_or_create(self):
+        self.create()
+        self.reload()
+        def post(session, url, headers, payload):
+            if url.endswith('/pageQueryDownloadTask'):
+                self.assertEqual(payload['taskId'], 'DB_123')
+                return 200, {'taskId': 'DB_123', 'status': 'SUCCESS'}
+            if url.endswith('/getDownloadUrl'):
+                self.assertEqual(payload['taskIdList'], ['DB_123'])
+                return 200, {'fileUrl': 'https://offline.invalid/signed'}
+            self.fail('Unexpected query/create: ' + url)
+        with patch.object(bill, 'post', side_effect=post), patch.object(bill, 'download_and_extract', return_value=([], [])) as download:
+            self.assertEqual(self.execute()['taskId'], 'DB_123')
+            self.assertEqual(download.call_args.args[2], 'DB_123')
+
+    def test_timeout_and_failed_poll_keep_id(self):
+        self.create()
+        self.reload()
+        for status, error in [('WAIT', TimeoutError), ('FAILED', RuntimeError)]:
+            with self.subTest(status=status), patch.object(bill, 'post', return_value=(200, {'taskId': 'DB_123', 'status': status})), self.assertRaises(error):
+                self.execute()
+            self.reload()
+            self.assertEqual(bill.resume_task(self.args, 'product-loan', self.dates)['taskId'], 'DB_123')
+
+    def test_uncertain_create_blocks_after_response_loss_or_missing_invalid_id(self):
+        for effect in [OSError('response lost'), {}, {'taskId': 123}]:
+            self.args.resume = False
+            self.args._task_state = {'taskJournalVersion': 1}
+            def create():
+                if isinstance(effect, Exception):
+                    raise effect
+                return effect
+            with self.subTest(effect=effect), self.assertRaises((OSError, RuntimeError, ValueError)):
+                bill.create_tracked_task(self.args, 'product-loan', self.dates, 7, create)
+            self.reload()
+            with patch.object(bill, 'post', side_effect=AssertionError('must not request')), self.assertRaisesRegex(RuntimeError, '禁止自动重建'):
+                self.execute()
+
+    def test_checkpoint_failure_retains_uncertain_intent(self):
+        save = bill.save_state
+        calls = 0
+        def fail_second(path, state):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError('disk full')
+            save(path, state)
+        with patch.object(bill, 'save_state', side_effect=fail_second), self.assertRaises(OSError):
+            self.create()
+        # Same generic failure path used by main must not save an uncheckpointed ID.
+        save(self.args._task_state_file, self.args._task_state)
+        self.reload()
+        with self.assertRaisesRegex(RuntimeError, '禁止自动重建'):
+            bill.resume_task(self.args, 'product-loan', self.dates)
+
+    def test_prewrite_failure_does_not_create(self):
+        with patch.object(bill, 'save_state', side_effect=OSError('disk full')), patch.object(bill, 'get_json') as create, self.assertRaises(OSError):
+            bill.create_tracked_task(self.args, 'product-loan', self.dates, 7, create)
+        create.assert_not_called()
+
+    def test_legacy_unfinished_and_changed_parameters_stop(self):
+        legacy = {'version': 2, 'completedModules': ['trade-subsidy'], 'results': {'trade-subsidy': {'status': 'zero', 'publishFiles': []}}, 'failedModule': 'product-loan'}
+        before = copy.deepcopy(legacy)
+        self.args._task_state = legacy
+        self.args.resume = True
+        with self.assertRaisesRegex(RuntimeError, '旧未完成状态'):
+            bill.resume_task(self.args, 'product-loan', self.dates)
+        self.assertEqual(legacy, before)
+        self.args.resume = False
+        self.args._task_state = {'taskJournalVersion': 1}
+        self.create()
+        self.reload()
+        with self.assertRaises(ValueError):
+            bill.resume_task(self.args, 'product-loan', {})
+
+    def test_hosting_matches_id_not_newest_record(self):
+        key = 'all-item-effects-export'
+        bill.create_tracked_task(self.args, key, self.dates, None, lambda: {'taskId': 'HOST_1'})
+        self.reload()
+        records = {'data': [{'taskId': 'OTHER', 'taskStatus': 'FINISHED', 'fileUrl': 'https://offline.invalid/wrong'}, {'taskId': 'HOST_1', 'taskStatus': 'FINISHED', 'fileUrl': 'https://offline.invalid/right'}]}
+        with patch.object(bill, 'get_json', side_effect=AssertionError('must not create')), patch.object(bill, 'post', return_value=(200, records)), patch.object(bill.time, 'sleep'), patch.object(bill, 'download_and_extract', return_value=([], [])) as download:
+            self.assertEqual(self.execute(key)['taskId'], 'HOST_1')
+            self.assertEqual(download.call_args.args[0], 'https://offline.invalid/right')
+
+    def test_missing_hosting_id_never_falls_back_to_latest(self):
+        key = 'all-item-effects-export'
+        bill.create_tracked_task(self.args, key, self.dates, None, lambda: {'taskId': 'HOST_1'})
+        self.reload()
+        with patch.object(bill, 'post', return_value=(200, {'data': [{'taskId': 'OTHER', 'taskStatus': 'FINISHED', 'fileUrl': 'https://offline.invalid/wrong'}]})), patch.object(bill.time, 'sleep'), patch.object(bill, 'download_and_extract') as download, self.assertRaises(TimeoutError):
+            self.execute(key)
+        download.assert_not_called()
+
+
+if __name__ == '__main__':
+    unittest.main()

@@ -14,6 +14,11 @@ persisted.
 from __future__ import annotations
 
 import argparse
+import builtins
+import functools
+
+# Emit each progress line immediately, including direct CLI and redirected runs.
+print = functools.partial(builtins.print, flush=True)
 import gzip
 import json
 import os
@@ -597,19 +602,26 @@ def safe_summary(value: Any) -> str:
     return text[:1500]
 
 
+def validate_task_id(value: Any) -> str:
+    """One boundary for response, persisted, poll and filesystem task IDs."""
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", value):
+        raise ValueError("taskId 必须为1至128位安全字符串（字母/数字/下划线/连字符）")
+    return value
+
+
 def find_task_id(value: Any) -> str | None:
-    for item in walk(value):
-        for key, child in item.items():
-            if key.lower() in {"taskid", "task_id"} and isinstance(child, (str, int)):
-                return str(child)
-    match = re.search(r"\bDB_[A-Za-z0-9_-]+\b", json.dumps(value, ensure_ascii=False))
-    return match.group(0) if match else None
+    ids = {validate_task_id(child) for item in walk(value) for key, child in item.items()
+           if key.lower() in {"taskid", "task_id"}}
+    if len(ids) > 1:
+        raise ValueError("响应包含多个不同 taskId，拒绝猜测")
+    return next(iter(ids), None)
 
 
 def task_state(value: Any, task_id: str) -> tuple[str, str]:
+    task_id = validate_task_id(task_id)
     records = []
     for item in walk(value):
-        if any(str(v) == task_id for k, v in item.items() if k.lower() in {"taskid", "task_id"}):
+        if any(validate_task_id(v) == task_id for k, v in item.items() if k.lower() in {"taskid", "task_id"}):
             records.append(item)
     fields: list[str] = []
     status_values: list[str] = []
@@ -723,6 +735,7 @@ def archive_base_name(path: Path) -> str:
 def download_and_extract(
     url: str, output_dir: Path, task_id: str, session: Any = None,
 ) -> tuple[list[Path], list[Path]]:
+    task_id = validate_task_id(task_id)
     output_dir.mkdir(parents=True, exist_ok=True)
     request = Request(url, headers={"user-agent": "Mozilla/5.0"})
     opener = session if session is not None else build_opener()
@@ -759,7 +772,7 @@ def download_and_extract(
             raise
     saved = [destination]
     extracted: list[Path] = []
-    extract_dir = output_dir / f"{archive_base_name(destination)}_extracted"
+    extract_dir = output_dir / f"extract-{task_id}"
     if destination.suffix.lower() in {".xlsx", ".xlsm", ".xls"}:
         # Already a usable workbook (e.g. the hosting all-item export); its
         # internal OOXML parts are not useful downloads, so do not unpack it.
@@ -948,7 +961,10 @@ def save_state(path: Path, state: dict[str, Any]) -> None:
     """Persist progress without cookies, tokens, headers, or signed URLs."""
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_name(path.name + ".tmp")
-    temp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    with temp.open("w", encoding="utf-8") as stream:
+        stream.write(json.dumps(state, ensure_ascii=False, indent=2))
+        stream.flush()
+        os.fsync(stream.fileno())
     os.replace(temp, path)
 
 
@@ -957,6 +973,44 @@ def validate_resume_dates(state: dict[str, Any], common_dates: dict[str, dict[st
     previous = state.get("dates")
     if previous and previous != expected:
         raise ValueError("续跑状态文件的结算/支付时间与当前 fetch 不一致，拒绝混合不同账期")
+
+
+def resume_task(args: argparse.Namespace, module_key: str, dates: dict[str, Any]) -> dict[str, Any] | None:
+    state = args._task_state
+    entry = state.get("remoteTasks", {}).get(module_key)
+    if entry is None:
+        if args.resume and state.get("taskJournalVersion") != 1:
+            raise RuntimeError("旧未完成状态没有可验证 taskId，无法承诺去重；停止，需人工核实远端任务")
+        return None
+    if not isinstance(entry, dict) or entry.get("dates") != dates:
+        raise ValueError("远端任务参数与当前模块日期不一致，拒绝恢复")
+    if entry.get("phase") != "created":
+        raise RuntimeError("创建请求可能已发送，但响应/taskId不确定；禁止自动重建，需人工核实远端任务")
+    validate_task_id(entry.get("taskId"))
+    return entry
+
+
+def create_tracked_task(args: argparse.Namespace, module_key: str, dates: dict[str, Any],
+                        query_rows: Any, create: Any) -> str:
+    state = args._task_state
+    entry = {"phase": "creating", "dates": dates, "queryRows": query_rows}
+    state.setdefault("remoteTasks", {})[module_key] = entry
+    # Write-ahead intent: failures here occur BEFORE any creation request.
+    save_state(args._task_state_file, state)
+    created = create()
+    task_id = find_task_id(created)
+    if task_id is None:
+        raise RuntimeError("创建请求已返回但没有 taskId；禁止自动重建，需人工核实远端任务")
+    entry.update(phase="created", taskId=task_id)
+    try:
+        save_state(args._task_state_file, state)
+    except BaseException:
+        # A later generic failure save must not turn a failed ID checkpoint into
+        # a promise of recoverability. Disk still has the creating intent.
+        entry.pop("taskId", None)
+        entry["phase"] = "creating"
+        raise
+    return task_id
 
 
 def module_output_dir(root: Path, module_key: str, date_filters: dict[str, dict[str, str]], multi: bool) -> Path:
@@ -1189,9 +1243,12 @@ def execute_export_module(
         "startDate": pair["start"].replace("-", ""),
         "endDate": pair["end"].replace("-", ""),
     })
-    created = get_json(session, f"{HOSTING_BASE}/task/createDownloadTask?{create_query}", headers)
-    created_task_id = find_task_id(created)
-    print(f"已创建导出任务：{created_task_id or '未知 taskId'}")
+    existing = resume_task(args, module_key, date_filters)
+    created_task_id = (existing["taskId"] if existing else create_tracked_task(
+        args, module_key, date_filters, None,
+        lambda: get_json(session, f"{HOSTING_BASE}/task/createDownloadTask?{create_query}", headers),
+    ))
+    print(f"导出任务：{created_task_id}")
     time.sleep(HOSTING_POLL_SECONDS)
 
     poll_payload = {"pageNo": 1, "pageSize": 10}
@@ -1199,7 +1256,8 @@ def execute_export_module(
     status = ""
     for attempt in range(1, HOSTING_MAX_POLLS + 1):
         _, status_response = post(session, f"{HOSTING_BASE}/task/pageListDownloadTask", headers, poll_payload)
-        record = hosting_first_record(status_response)
+        record = next((item for item in hosting_task_records(status_response)
+                       if find_task_id(item) == created_task_id), None)
         status = hosting_status(record) if record else ""
         print(f"轮询 {attempt}/{HOSTING_MAX_POLLS}：taskStatus={status or '未找到任务记录'}")
         if status == "FINISHED":
@@ -1212,13 +1270,11 @@ def execute_export_module(
         raise TimeoutError(f"轮询 {HOSTING_MAX_POLLS} 次后导出任务仍未 FINISHED")
 
     if not record:
-        raise RuntimeError("查询导出任务列表成功，但第一条没有任务记录")
-    task_id = find_task_id(record) or created_task_id or "export"
-    if not created_task_id:
-        print(f"导出任务 taskId：{task_id}")
+        raise RuntimeError("查询导出任务列表成功，但没有对应任务记录")
+    task_id = validate_task_id(created_task_id)
     file_url = hosting_file_url(record)
     if not file_url:
-        raise RuntimeError("任务已 FINISHED，但第一条记录中没有 fileUrl")
+        raise RuntimeError("任务已 FINISHED，但对应任务记录中没有 fileUrl")
     target_dir = module_output_dir(args.output_dir.expanduser().resolve(), module_key, date_filters, multi)
     saved, extracted = download_and_extract(file_url, target_dir, task_id, session)
     print("最终状态：FINISHED")
@@ -1364,10 +1420,14 @@ def execute_module(
         "param": {**date_filters},
         "billType": bill_type,
     }
-    _, query = post(session, f"{BASE}/bill/queryBillDetail", headers, query_payload)
-    total = query_total(query)
+    existing = resume_task(args, module_key, date_filters)
+    if existing:
+        total = existing.get("queryRows")
+    else:
+        _, query = post(session, f"{BASE}/bill/queryBillDetail", headers, query_payload)
+        total = query_total(query)
     print(f"查询成功：{total if total is not None else '未知'} 条")
-    if is_zero_total(total):
+    if not existing and is_zero_total(total):
         result: dict[str, Any] | None = None
         if not args.no_pan_suan:
             result = build_empty_pan_suan(
@@ -1388,10 +1448,10 @@ def execute_module(
         }
 
     create_payload = {"downloadType": DOWNLOAD_TYPE, "param": {**date_filters, "billType": bill_type}}
-    _, created = post(session, f"{BASE}/download/download", headers, create_payload)
-    task_id = find_task_id(created)
-    if not task_id:
-        raise RuntimeError("创建下载任务成功但响应中没有 taskId")
+    task_id = (existing["taskId"] if existing else create_tracked_task(
+        args, module_key, date_filters, total,
+        lambda: post(session, f"{BASE}/download/download", headers, create_payload)[1],
+    ))
     print(f"已创建下载任务：{task_id}")
 
     center_referer = f"https://tgc.tmall.com/ds/page/supplier/download-service-center-next?taskId={task_id}&c2mNavigatorShellPage=7&c2mNavigatorPageOpener=0"
@@ -1582,6 +1642,11 @@ def main() -> int:
     if args.resume:
         resume_state = load_resume_state(state_file)
         validate_resume_dates(resume_state, common_dates)
+        if resume_state.get("scope") != args.module or resume_state.get("shopName") != args.shop_name:
+            raise ValueError("续跑状态的模块范围/公司名称不一致，拒绝恢复")
+        if (resume_state.get("taskJournalVersion") == 1 and
+                resume_state.get("expectedCompany") != (args.expect_company or args.shop_name)):
+            raise ValueError("续跑状态的目标公司不一致，拒绝恢复")
         completed = [key for key in resume_state.get("completedModules", []) if key in MODULES]
         persisted_skips = [key for key in resume_state.get("manualSkippedModules", []) if key in MODULES]
 
@@ -1592,6 +1657,12 @@ def main() -> int:
         return 0
     # Validate every module's date payload before making the first network request.
     dates_by_module = {key: module_date_filters(args, body, MODULES[key]) for key in module_keys}
+    args._task_state = resume_state if args.resume else {"taskJournalVersion": 1}
+    args._task_state_file = state_file
+    # Reject ambiguous/legacy attempts before loading any authentication data.
+    for key in module_keys:
+        if MODULES[key].get("api_style") != "rules-center":
+            resume_task(args, key, dates_by_module[key])
     if query_request:
         base_headers = headers_from(query_request)
         if not base_headers.get("cookie"):
@@ -1604,6 +1675,10 @@ def main() -> int:
     multi = args.module == "all" or len(module_keys) > 1
     state_dates = {key: common_dates[key] for key in ("writeOffTime", "orderPayTime") if key in common_dates}
     state = {
+        **resume_state,
+        "taskJournalVersion": resume_state.get("taskJournalVersion") if args.resume else 1,
+        "remoteTasks": dict(resume_state.get("remoteTasks", {})),
+        "expectedCompany": args.expect_company or args.shop_name,
         "version": 2,
         "scope": args.module,
         "shopName": args.shop_name,
@@ -1614,6 +1689,7 @@ def main() -> int:
         "results": dict(resume_state.get("results", {})) if isinstance(resume_state.get("results", {}), dict) else {},
     }
 
+    args._task_state = state
     save_state(state_file, state)
 
     def run_one(module_key: str, is_last: bool) -> dict[str, Any]:

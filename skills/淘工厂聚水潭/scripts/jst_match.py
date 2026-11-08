@@ -167,7 +167,7 @@ def _source_path(path):
 def _backup_directory(fine_path, backup_dir):
     # Sibling of the merge input directory, never a child of that directory.
     directory = (Path(backup_dir).expanduser().absolute() if backup_dir is not None
-                 else fine_path.parent.parent / '.jst-fine-backups')
+                 else __import__('tgc_runtime').runtime_for(fine_path) / 'backups')
     # Canonicalize the platform's /tmp alias, but reject user-controlled symlinks.
     for part in [directory, *directory.parents]:
         if part.is_symlink() and str(part) not in ('/tmp', '/var'):
@@ -279,13 +279,15 @@ def _unlock_output(stream):
 
 
 def _publish(original_bytes, destination, sheet, changes, backup_dir):
-    lock = destination.with_name(destination.name + '.lock')
+    from tgc_runtime import runtime_for
+    lock = runtime_for(destination) / 'match.lock'
+    lock.parent.mkdir(parents=True, exist_ok=True)
     lock_stream = _lock_output(lock)
     temp = None
     try:
         if destination.is_symlink() or destination.read_bytes() != original_bytes:
             raise MatchError('Original workbook changed during matching')
-        fd, name = tempfile.mkstemp(prefix='.' + destination.stem + '-', suffix='.xlsx', dir=destination.parent)
+        fd, name = tempfile.mkstemp(prefix='.' + destination.stem + '-', suffix='.xlsx', dir=destination.parent.parent)
         os.close(fd)
         temp = Path(name)
         with zipfile.ZipFile(io.BytesIO(original_bytes)) as source, zipfile.ZipFile(temp, 'w') as target:
@@ -310,7 +312,7 @@ def _publish(original_bytes, destination, sheet, changes, backup_dir):
                     raise MatchError(f'Validation failed: target value: {coord}')
         finally:
             check.close()
-        with temp.open('rb') as handle:
+        with temp.open('r+b') as handle:
             os.fsync(handle.fileno())
         backup_dir.mkdir(parents=True, exist_ok=True)
         # A content-addressed backup is reused only after exact byte validation.
@@ -395,6 +397,12 @@ def match_fines(fine_path, order_paths: Iterable, shop_name, trigger, *, sheet=N
         counts = dict(matched=0, unmatched=0, ambiguous=0, invalid=0, conflict=0,
                       filled_cells=0, overwritten_cells=0, changed_cells=0)
         details = []
+        # Only explicit amount headers; formulas/unparseable values remain unknown.
+        from decimal import Decimal, InvalidOperation
+        amount_columns = [col for col in range(1, ws.max_column + 1)
+                          if str(ws.cell(header, col).value or '').strip() in
+                          ('罚款金额', '处罚金额', '扣款金额', '金额')]
+        review_amount, known_amount_rows, unknown_amount_rows = Decimal('0'), 0, 0
         reason_counts = dict(no_order_id=0, erp_missing=0, ambiguous=0,
                              invalid_fields=0, matched=0)
         for row_no in range(header + 1, ws.max_row + 1):
@@ -423,14 +431,34 @@ def match_fines(fine_path, order_paths: Iterable, shop_name, trigger, *, sheet=N
                             counts['filled_cells' if _empty(cell.value) else 'overwritten_cells'] += 1
             counts[status] += 1
             reason_counts[reason_code] += 1
-            details.append({'row': row_no, 'order_ids': ids, 'status': status,
-                            'reason': reason, 'reason_code': reason_code,
-                            'candidate_pairs': len(candidates)})
+            detail = {'row': row_no, 'order_ids': ids, 'status': status,
+                      'reason': reason, 'reason_code': reason_code,
+                      'candidate_pairs': len(candidates)}
+            if status != 'matched':
+                amount = None
+                if len(amount_columns) == 1:
+                    cell = ws.cell(row_no, amount_columns[0])
+                    if cell.data_type not in ('f', 'e') and not isinstance(cell.value, bool):
+                        try:
+                            amount = Decimal(str(cell.value).replace(',', '').strip())
+                            if not amount.is_finite(): amount = None
+                        except (InvalidOperation, ValueError):
+                            pass
+                if amount is None:
+                    unknown_amount_rows += 1
+                else:
+                    review_amount += amount
+                    known_amount_rows += 1
+                    detail['amount'] = str(amount)
+            details.append(detail)
         backup = (_publish(original_bytes, fine_path, ws.title, changes, backup_directory)
                   if changes else None)
         return {'output': str(fine_path), 'counts': counts, 'sheet': ws.title,
                 'backup': backup, 'changed': bool(changes), 'report': details,
                 'reason_counts': reason_counts,
+                'review_amount': str(review_amount) if known_amount_rows else None,
+                'review_amount_known_rows': known_amount_rows,
+                'review_amount_unknown_rows': unknown_amount_rows,
                 'erp_issues': erp_issues, 'report_sheet': None, 'added_columns': []}
     finally:
         wb.close()

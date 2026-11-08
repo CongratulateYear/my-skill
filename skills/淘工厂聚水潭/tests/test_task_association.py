@@ -53,7 +53,7 @@ class TaskAssociationTests(unittest.TestCase):
             with self.assertRaisesRegex(export.ExportError, "歧义"):
                 self.run_it(session, root)
             self.assertFalse((root / "orders.xlsx").exists())
-            self.assertFalse(any(p["Method"] == "GetExportData" for _, p, _ in session.calls))
+            self.assertFalse(any(p["Method"] == "CheckAndGetExportData" for _, p, _ in session.calls))
 
     def test_wrong_coverage_never_published_even_if_log_count_matches(self):
         for ids in (IDS21[:-1], IDS21 + ["999999999999999999"], IDS21[:-1] + ["999999999999999999"]):
@@ -134,7 +134,7 @@ class TaskAssociationTests(unittest.TestCase):
             with self.assertRaisesRegex(export.ExportError, "绝不重建"):
                 self.run_it(session, root, resume=True)
             self.assertEqual(self.state(root)["phase"], "creating")
-            self.assertFalse(any(p["Method"] in ("ExportBySync", "GetExportData") for _, p, _ in session.calls))
+            self.assertFalse(any(p["Method"] in ("ExportBySync", "CheckAndGetExportData") for _, p, _ in session.calls))
 
     def test_candidate_coverage_failure_can_resume_without_reassociation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -144,11 +144,11 @@ class TaskAssociationTests(unittest.TestCase):
             with self.assertRaisesRegex(export.ExportError, "范围/覆盖"):
                 self.run_it(first, root)
             second = self.session()
-            report = self.run_it(second, root, resume=True)
-            self.assertTrue(report["ok"])
-            self.assertEqual(report["task_total_count"], 25)
+            with self.assertRaisesRegex(export.ExportError, "范围/覆盖"):
+                self.run_it(second, root, resume=True)
             self.assertEqual(second.log_calls, 0)
-            self.assertFalse(any(p["Method"] in ("ExportBySync", "ExportCheckConfirm") for _, p, _ in second.calls))
+            self.assertEqual(second.calls, [])
+            self.assertFalse((root / "orders.xlsx").exists())
 
     def test_missing_or_invalid_count_is_diagnostic_only(self):
         for count in (None, "unknown", "", -1, {"Cookie": "not-a-count"}):

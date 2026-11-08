@@ -40,6 +40,6 @@ class SessionTests(unittest.TestCase):
         with patch.object(c,'IS_WINDOWS',True),patch.dict(c.os.environ,{'LOCALAPPDATA':'C:/Users/Test/AppData/Local'}):
             self.assertIn('Microsoft',str(c._user_data_root('edge')))
     def test_darwin_root(self):
-        with patch.object(c,'IS_WINDOWS',False):self.assertIn('Library/Application Support',str(c._user_data_root('chrome')))
+        with patch.object(c,'IS_WINDOWS',False):self.assertIn('Library/Application Support',c._user_data_root('chrome').as_posix())
 
 if __name__=='__main__':unittest.main()

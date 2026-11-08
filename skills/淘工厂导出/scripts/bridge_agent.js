@@ -8,13 +8,15 @@
   if (window.__dshBridgeRunning) return "bridge agent already running";
   window.__dshBridgeRunning = true;
   const BASE = window.__dshBridgeBase || "http://127.0.0.1:8899";
+  const AGENT_ID = crypto.randomUUID();
   const MAX_BINARY = 24 * 1024 * 1024;
   async function local(path, payload) {
     const response = await fetch(BASE + path, payload === undefined ?
       { cache: "no-store" } : {
         method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify(payload), cache: "no-store"
+        body: JSON.stringify(Object.assign({}, payload, { agentId: AGENT_ID })), cache: "no-store"
       });
+    if (response.status === 409) window.__dshBridgeRunning = false;
     if (!response.ok) throw new Error("桥响应 " + response.status);
     return response;
   }
@@ -29,6 +31,7 @@
     return btoa(text);
   }
   async function execute(task) {
+    if (task.agentId !== AGENT_ID) throw new Error("任务代理不匹配");
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), Math.max(1, task.timeout || 300) * 1000);
     try {
@@ -60,7 +63,7 @@
     while (window.__dshBridgeRunning) {
       try {
         await reportSession();
-        const response = await local("/next?wait=25");
+        const response = await local("/next?wait=25&agentId=" + encodeURIComponent(AGENT_ID));
         if (response.status === 204) continue;
         const task = await response.json();
         let result;
@@ -69,6 +72,7 @@
         await reportSession();
         await local("/result", Object.assign({ taskId: task.taskId }, result));
       } catch (error) {
+        if (!window.__dshBridgeRunning) break;
         await new Promise(resolve => setTimeout(resolve, 2000));
       }
     }

@@ -82,7 +82,7 @@ class LiveSession:
             if self.interrupt:
                 raise TimeoutError("sensitive transport URL cookie")
             return envelope(None)
-        if method == "GetExportData":
+        if method == "CheckAndGetExportData":
             if payload["Args"] != ["11"]:
                 raise AssertionError("RequestId or wrong task selected")
             return envelope("https://www.erp321.com/synthetic.xlsx")
@@ -153,7 +153,7 @@ class LiveExportTests(unittest.TestCase):
             with self.assertRaisesRegex(export.ExportError, "歧义"):
                 self.run_it(session, root)
             self.assertFalse((root / "orders.xlsx").exists())
-            self.assertFalse(any(p["Method"] == "GetExportData" for _, p, _ in session.calls))
+            self.assertFalse(any(p["Method"] == "CheckAndGetExportData" for _, p, _ in session.calls))
 
     def test_type_filter_but_count_is_not_a_filter(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -161,7 +161,7 @@ class LiveExportTests(unittest.TestCase):
             session = LiveSession(tasks=[task(11), task(12, typ="other"), task(13, count=9)])
             with self.assertRaisesRegex(export.ExportError, "歧义"):
                 self.run_it(session, root, export_type="order")
-            self.assertFalse(any(p["Method"] == "GetExportData" for _, p, _ in session.calls))
+            self.assertFalse(any(p["Method"] == "CheckAndGetExportData" for _, p, _ in session.calls))
 
     def test_foreign_or_incomplete_workbook_rejected(self):
         for ids in (IDS[:1], IDS + ["323456789012345678"]):
@@ -253,7 +253,7 @@ class LiveExportTests(unittest.TestCase):
             session = DifferentAccount()
             with self.assertRaisesRegex(export.ExportError, "账号已切换"):
                 self.run_it(session, root, resume=True)
-            self.assertFalse(any(p["Method"] in ("ExportBySync", "GetExportData") for _, p, _ in session.calls))
+            self.assertFalse(any(p["Method"] in ("ExportBySync", "CheckAndGetExportData") for _, p, _ in session.calls))
 
     def test_same_journal_concurrent_run_rejected(self):
         with tempfile.TemporaryDirectory() as directory:

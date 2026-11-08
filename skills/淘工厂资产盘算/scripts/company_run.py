@@ -11,7 +11,85 @@ import os
 from pathlib import Path
 import sys
 import uuid
+import math
+import threading
+import time
 from contextlib import contextmanager
+
+
+PROGRESS_STAGES = frozenset({
+    'initializing', 'resume_verification', 'login', 'export', 'artifact_verification',
+    'fine_verification', 'erp_prepare', 'erp_session', 'erp', 'erp_scope_authorization', 'merge',
+    'inventory_validation', 'delivery_recalculation', 'publication', 'final_validation',
+    'delivery_review', 'delivery_coverage', 'delivery_audit_preparation',
+    'delivery_engine', 'delivery_cache_transfer', 'delivery_integrity', 'delivery_amount_audit',
+})
+
+
+class Progress:
+    """Only fixed stage names and timings leave this reporter; never business inputs."""
+
+    def __init__(self, interval=60.0):
+        self.interval = float(interval)
+        if not math.isfinite(self.interval) or self.interval <= 0:
+            raise ValueError('heartbeat interval must be finite and greater than zero')
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._stage = 'initializing'
+        self._started = self._stage_started = time.monotonic()
+        self.stage_seconds = {}
+
+    def _complete_stage(self):
+        elapsed = time.monotonic() - self._stage_started
+        self.stage_seconds[self._stage] = round(self.stage_seconds.get(self._stage, 0) + elapsed, 3)
+        self._emit('stage_completed')
+
+    def _emit(self, event):
+        now = time.monotonic()
+        # Do not include arguments, paths, credentials, exception messages or responses.
+        record = {'type': 'pipeline_progress', 'event': event, 'stage': self._stage,
+                  'elapsed_seconds': round(now - self._started, 3),
+                  'stage_elapsed_seconds': round(now - self._stage_started, 3)}
+        try:
+            print(json.dumps(record), file=sys.stderr, flush=True)
+        except (OSError, ValueError):
+            pass  # A closed diagnostic stream must not interrupt a business operation.
+
+    def set_stage(self, stage):
+        if stage not in PROGRESS_STAGES:
+            raise ValueError('unknown progress stage')
+        with self._lock:
+            if stage == self._stage:
+                return  # Repeated observation must not reset elapsed time.
+            self._complete_stage()
+            self._stage = stage
+            self._stage_started = time.monotonic()
+            self._emit('stage')
+
+    def call(self, stage, function, *args, **kwargs):
+        self.set_stage(stage)
+        return function(*args, **kwargs)
+
+    def _heartbeat(self):
+        while not self._stop.wait(self.interval):
+            with self._lock:
+                self._emit('heartbeat')
+
+    def __enter__(self):
+        self._emit('stage')
+        self._thread = threading.Thread(target=self._heartbeat, name='pipeline-progress', daemon=True)
+        self._thread.start()
+        return self
+
+    def finish(self, event):
+        self._stop.set()
+        self._thread.join()
+        with self._lock:
+            self._complete_stage()
+            self._emit(event)
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.finish('failed' if exc_type or getattr(self, 'result', 0) else 'finished')
 
 
 def load_module(path, name):
@@ -24,6 +102,20 @@ def load_module(path, name):
 
 def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def valid_erp_outputs(report):
+    """Verify every published ERP shard, not merely the first workbook."""
+    proof = report.get('receipt', {})
+    outputs = proof.get('outputs_sha256')
+    if not isinstance(outputs, dict) or not outputs:
+        return False
+    output = report.get('output')
+    if output not in outputs or proof.get('output_sha256') != outputs[output]:
+        return False
+    return all(Path(path).is_file() and not Path(path).is_symlink()
+               and Path(path).suffix.lower() == '.xlsx' and digest(path) == sha
+               for path, sha in outputs.items())
 
 
 def save(path, value):
@@ -58,20 +150,242 @@ def locked(path):
                 fcntl.flock(stream, fcntl.LOCK_UN)
 
 
+def erp_recovery_status(readiness):
+    """Classify sanitized session evidence, not browser ownership or login credentials."""
+    codes = {readiness.get(key) for key in ('reason', 'error_code', 'session_status')
+             if isinstance(readiness.get(key), str)}
+    recovery = readiness.get('recovery_action') or readiness.get('action')
+    if isinstance(recovery, dict) and isinstance(recovery.get('reason'), str):
+        codes.add(recovery['reason'])
+    bridge = {'bridge_not_running', 'bridge_agent_missing', 'bridge_agent_not_connected',
+              'bridge_unavailable', 'bridge_timeout'}
+    return {
+        'execution_status': 'awaiting_agent',
+        'recovery_kind': 'bridge_connection' if codes & bridge else 'session_inspection',
+        'next_action': 'recover_own_erp_tab_then_resume',
+        'user_input_required': 'not_established',
+        'resume_required': True,
+    }
+
+
+def _recovery_task_id(value):
+    """Normalize only valid positive decimal string/int IDs; never coerce bools.
+
+    This is a planning hint only. Original evidence is not rewritten: the scope
+    generator requires string IDs and rechecks the full original task binding.
+    """
+    if type(value) is int:
+        return str(value) if value > 0 else None
+    if (type(value) is str and value and value.isascii() and value.isdecimal()
+            and int(value) > 0):
+        return value
+    return None
+
+
+def erp_failure_recovery(erp_result, erp_state, approval_script, order_ids):
+    """Plan from this invocation's exact paths only; never scan historical runtimes.
+
+    This is a non-authorizing hint. The offline generator still revalidates all
+    six fields, pending bytes and query evidence before creating any approval.
+    """
+    plan = {'execution_status': 'incomplete', 'resume_required': True,
+            'next_action': 'inspect_current_erp_result_then_resume',
+            'evidence_file': str(erp_result), 'state_file': str(erp_state),
+            'waiting_policy': 'completion_notification_first_no_repeated_polling'}
+    try:
+        if (Path(erp_result).is_symlink() or Path(erp_state).is_symlink()
+                or Path(erp_result).stat().st_size > 2 * 1024 * 1024
+                or Path(erp_state).stat().st_size > 2 * 1024 * 1024):
+            return plan
+        report = json.loads(Path(erp_result).read_text(encoding='utf-8'))
+        state = json.loads(Path(erp_state).read_text(encoding='utf-8'))
+        template = report.get('error_details', {}).get('approval_required', {})
+        required = {'approved', 'task_id', 'sha256', 'output', 'requested_ids', 'extra_ids'}
+        task_id = _recovery_task_id(template.get('task_id'))
+        candidates = state.get('candidate_ids')
+        pending = state.get('pending')
+        if (report.get('error_code') != 'scope_approval_required'
+                or set(template) != required or template['approved'] is not False
+                or type(state.get('version')) is not int or state['version'] != 2
+                or state.get('phase') != 'candidate' or task_id is None
+                or not isinstance(candidates, list) or len(candidates) != 1
+                or _recovery_task_id(candidates[0]) != task_id
+                or not isinstance(pending, dict)
+                or set(pending) != {'task_id', 'sha256', 'output', 'requested_ids'}
+                or _recovery_task_id(pending['task_id']) != task_id
+                or template['requested_ids'] != order_ids
+                or state.get('requested_ids') != order_ids
+                or template['output'] != state.get('output')
+                or any(pending[key] != template[key] for key in
+                    ('sha256', 'output', 'requested_ids'))):
+            return plan
+        approval = Path(erp_state).parent / ('scope_approval_' + task_id + '.json')
+        plan.update(next_action='validate_scope_evidence_under_existing_consent_then_resume',
+                    approval_file=str(approval), evidence_validation='required_by_offline_generator',
+                    consent_required=True, automatic_approval=False,
+                    approval_file_exists=approval.exists(),
+                    approval_argv=[sys.executable, str(approval_script),
+                        '--state-file', str(erp_state), '--evidence-file', str(erp_result),
+                        '--approval-file', str(approval), '--human-approved'],
+                    resume_arguments=['--resume', '--erp-scope-approval-file', str(approval)])
+    except (OSError, ValueError, TypeError, AttributeError, KeyError):
+        pass  # No arbitrary exception/response text may enter diagnostics.
+    return plan
+
+
+def resume_proven_partner(plan, command, *, consent, explicit_approval, run, progress):
+    """One bounded recovery under recorded consent; generator remains authority.
+
+    Only called after the ERP child exited. Existing authorization is never
+    overwritten or implicitly reused. Failed generation leaves ERP untouched.
+    """
+    if (consent is not True or explicit_approval
+            or plan.get('next_action') != 'validate_scope_evidence_under_existing_consent_then_resume'
+            or plan.get('approval_file_exists') is not False):
+        return None
+    argv = plan.get('approval_argv')
+    approval = plan.get('approval_file')
+    if not isinstance(argv, list) or not approval:
+        return None
+    rc = progress.call('erp_scope_authorization', run, argv)
+    if rc:
+        return None
+    resumed = list(command)
+    if '--resume' not in resumed:
+        resumed.append('--resume')
+    resumed += ['--scope-approval-file', approval]
+    return progress.call('erp', run, resumed)
+
+
+def delivery_summary(journal, folder, main_workbook=None):
+    """Read existing evidence only; never open workbooks or upgrade old journals."""
+    from delivery_coverage import MODULES
+    identity = journal.get('identity') or {}
+    receipt = journal.get('receipt') or {}
+    results = receipt.get('results') or {}
+    counts = dict.fromkeys(('completed', 'zero', 'failed', 'skipped', 'not_executed', 'unknown'), 0)
+    for module in MODULES:
+        status = (results.get(module) or {}).get('status')
+        if status is None and module in (receipt.get('skipped') or []):
+            status = 'skipped'
+        counts[status if status in counts else 'unknown'] += 1
+    erp = journal.get('erp') or {}
+    matching = erp.get('matching') or {}
+    delivery = journal.get('delivery') or {}
+    export_only = identity.get('mode') == 'export'
+
+    def check(evidence):
+        if export_only:
+            return {'status': 'not_applicable', 'ok': None}
+        ok = (evidence or {}).get('ok')
+        return {'status': 'passed' if ok is True else 'failed' if ok is False else 'unknown',
+                'ok': ok if type(ok) is bool else None}
+
+    def matching_counts(key, fields):
+        values = matching.get(key)
+        return ({field: values[field] for field in fields if field in values}
+                if isinstance(values, dict) else None)
+
+    audit = delivery.get('audit') or {}
+    row_counts = matching.get('counts') or {}
+    review_keys = ('unmatched', 'ambiguous', 'invalid', 'conflict')
+    def row_total(keys):
+        return (sum(row_counts[key] for key in keys)
+                if all(type(row_counts.get(key)) is int and row_counts[key] >= 0 for key in keys) else None)
+
+    review_rows = row_total(review_keys)
+    matching_status = erp.get('matching_status', 'unknown')
+    completed = journal.get('stage') == 'complete'
+    # Unknown historical evidence must never become an all-matched conclusion.
+    match_complete = matching_status == 'complete_match' and review_rows == 0
+    if erp.get('skipped') in ('confirmed_zero', 'no_order_id'):
+        match_complete = erp.get('skipped') == 'confirmed_zero'
+    conclusion = ('流程未完成，需要处理后续跑' if not completed else
+                  '流程完成，匹配完整' if match_complete else '流程完成，存在待核查')
+    return {
+        'execution_status': 'completed' if completed else 'incomplete',
+        'matching_status': matching_status,
+        'conclusion': conclusion,
+        'review_guidance': {
+            'no_order_id': '核对处罚来源及主订单编号；保留原值，不猜填',
+            'erp_missing': '核对ERP历史订单及查询范围；不得自动扩大范围或重建任务',
+            'ambiguous': '核对订单商品对应关系；不自动任选商品',
+            'invalid_fields': '核对ERP商品字段；不以空值覆盖原值',
+        },
+        'review_focus': {
+            'review_rows': review_rows,
+            'reason_counts': matching_counts('reason_counts', ('no_order_id','erp_missing','ambiguous','invalid_fields')),
+            'missing_unique_order_count': (len(set(erp['missing_ids']))
+                if isinstance(erp.get('missing_ids'), list)
+                and all(isinstance(item, str) for item in erp['missing_ids']) else None),
+            'amount': matching.get('review_amount'),
+            'amount_known_rows': matching.get('review_amount_known_rows'),
+            'amount_unknown_rows': matching.get('review_amount_unknown_rows'),
+            'worksheet': None if export_only else '待核查',
+            'scope_expanded': False,
+        },
+        'company': identity.get('company'), 'dates': identity.get('dates'),
+        'mode': identity.get('mode'), 'main_workbook': None if export_only else (str(main_workbook) if main_workbook else None),
+        'source_directory': str(folder),
+        'modules': {'total': len(MODULES), 'counts': counts, 'basis': 'receipt'},
+        'punishment_matching': {
+            'status': erp.get('matching_status', 'unknown'), 'skipped': erp.get('skipped'),
+            'total_rows': row_total(('matched',) + review_keys), 'review_rows': row_total(review_keys),
+            'counts': matching_counts('counts', ('matched','unmatched','ambiguous','invalid','conflict','filled_cells','overwritten_cells','changed_cells')),
+            'reason_counts': matching_counts('reason_counts', ('no_order_id','erp_missing','ambiguous','invalid_fields','matched')),
+            'missing_ids': erp.get('missing_ids'),
+            'review_amount': matching.get('review_amount'),
+            'review_amount_known_rows': matching.get('review_amount_known_rows'),
+            'review_amount_unknown_rows': matching.get('review_amount_unknown_rows')},
+        'recalculation': check(delivery.get('recalculation')),
+        'structural_validation': check(journal.get('validation')),
+        'amount_audit': {'status': 'not_applicable' if export_only else audit.get('status', 'unknown'),
+                         'verified': None if export_only else audit.get('verified'),
+                         'blocking': None if export_only else audit.get('blocking'),
+                         'counts': None if export_only else audit.get('counts')},
+    }
+
+
 def execute(args, folder, export_cmd, merge_cmd, run, gate, gate_cmd, resolve):
+    if getattr(args, 'erp_scope_approval_file', None) and not args.resume:
+        raise ValueError('ERP范围授权只能显式 --resume 使用')
+    with Progress(getattr(args, 'heartbeat_interval', 60.0)) as progress:
+        result = _execute(args, folder, export_cmd, merge_cmd, run, gate, gate_cmd, resolve, progress)
+        progress.result = result
+        return result
+
+
+def _execute(args, folder, export_cmd, merge_cmd, run, gate, gate_cmd, resolve, progress):
     identity = {'company': args.company_name, 'module': args.module,
                 'erp_expect_company': getattr(args, 'erp_expect_company', None),
                 'dates': {key: getattr(args, key) for key in
                           ('order_pay_start','order_pay_end','write_off_start','write_off_end')},
                 'mode': args.mode, 'merge_command': merge_cmd}
-    journal_path = folder / '.company-run.json'
+    from tgc_runtime import runtime_for
+    state_root = runtime_for(folder)
+    legacy = [folder / name for name in ('.company-run.json', '.company-run.lock',
+              '.export-result.json', '.erp-result.json', '.work-' + args.canonical_module)]
+    if any(path.exists() or path.is_symlink() for path in legacy):
+        raise ValueError('检测到旧版目录内运行状态；请核实并迁移完整状态或使用新批次，不自动重建任务')
+    state_root.mkdir(parents=True, exist_ok=True)
+    journal_path = state_root / '.company-run.json'
     folder.mkdir(parents=True, exist_ok=True)
-    with locked(folder / '.company-run.lock'):
+    with locked(state_root / '.company-run.lock'):
+        progress.set_stage('resume_verification')
         if journal_path.exists():
             if not args.resume:
                 raise ValueError('已有公司运行记录；请用 --resume 或新批次目录，不覆盖旧成果')
             journal = json.loads(journal_path.read_text(encoding='utf-8'))
-            if journal.get('identity') != identity or journal.get('version') != 1:
+            old_identity = journal.get('identity') or {}
+            # --no-recalculate only removes duplicate pre-delivery engine execution;
+            # tolerate this explicit version migration without changing business inputs.
+            compatible_identity = dict(old_identity)
+            if isinstance(compatible_identity.get('merge_command'),list):
+                compatible_identity['merge_command'] = [x for x in compatible_identity['merge_command'] if x != '--no-recalculate']
+            comparison = dict(identity)
+            if isinstance(comparison.get('merge_command'),list):
+                comparison['merge_command'] = [x for x in comparison['merge_command'] if x != '--no-recalculate']
+            if compatible_identity != comparison or journal.get('version') != 1:
                 raise ValueError('续跑公司/日期/模式/输出位置不符')
         else:
             if any(folder.glob('*.xlsx')):
@@ -79,8 +393,8 @@ def execute(args, folder, export_cmd, merge_cmd, run, gate, gate_cmd, resolve):
             journal = {'version': 1, 'identity': identity, 'run_id': uuid.uuid4().hex,
                        'stage': 'new'}
             save(journal_path, journal)
-        receipt_path = folder / '.export-result.json'
-        erp_result = folder / '.erp-result.json'
+        receipt_path = state_root / '.export-result.json'
+        erp_result = state_root / '.erp-result.json'
         # Recover a publication that succeeded just before journal checkpoint.
         if journal['stage'] in ('new', 'export_running'):
             receipt = None
@@ -90,14 +404,20 @@ def execute(args, folder, export_cmd, merge_cmd, run, gate, gate_cmd, resolve):
                     receipt = candidate
             if receipt is None:
                 if gate_cmd:
-                    rc, _ = gate(gate_cmd)
+                    rc, _ = progress.call('login', gate, gate_cmd)
                     if rc:
                         return rc
+                # Advisory local connectivity only: no cookie/session/order query,
+                # no bridge startup and no ERP identity assumption before fines exist.
+                if getattr(args, 'erp_transport', 'cookie') != 'cookie':
+                    from orchestration_policy import bridge_precheck
+                    print(json.dumps({'type': 'erp_bridge_precheck',
+                        **bridge_precheck(getattr(args, 'erp_bridge_url', None))}, ensure_ascii=False), flush=True)
                 journal['stage'] = 'export_running'; save(journal_path, journal)
                 command = [c for c in export_cmd if c != '--resume']
-                if args.resume and (folder / ('.work-' + args.canonical_module)).exists():
+                if args.resume and (state_root / ('.work-' + args.canonical_module)).exists():
                     command.append('--resume')
-                rc = run(command + ['--result-file', str(receipt_path), '--run-id', journal['run_id']])
+                rc = progress.call('export', run, command + ['--state-dir', str(state_root), '--result-file', str(receipt_path), '--run-id', journal['run_id']])
                 if rc:
                     return rc
                 receipt = json.loads(receipt_path.read_text(encoding='utf-8'))
@@ -108,7 +428,12 @@ def execute(args, folder, export_cmd, merge_cmd, run, gate, gate_cmd, resolve):
             journal['receipt'] = receipt
             journal['hashes'] = receipt['files']
             journal['stage'] = 'exported'; save(journal_path, journal)
+        progress.set_stage('artifact_verification')
         receipt = journal['receipt']
+        if journal.get('erp_outputs'):
+            for path, sha in journal['erp_outputs'].items():
+                if not Path(path).is_file() or digest(path) != sha:
+                    raise ValueError('已交付ERP分片已被外部更改：' + path)
         if {path.name for path in folder.glob('*.xlsx') if not path.name.startswith(('.', '~$'))} != set(journal['hashes']):
             raise ValueError('公司输入目录出现非本次账单或缺少账单；不混入合并')
         fine_names = [name for name in receipt['files'] if name == '处罚数据.xlsx' or
@@ -131,7 +456,7 @@ def execute(args, folder, export_cmd, merge_cmd, run, gate, gate_cmd, resolve):
                 fine = folder/fine_names[0]
                 jst_script = resolve('淘工厂聚水潭','taogongchang-jushuitan','jushuitan.py')
                 matcher = load_module(jst_script.with_name('jst_match.py'), 'chain_match')
-                ids = matcher.extract_order_ids(fine)
+                ids = progress.call('fine_verification', matcher.extract_order_ids, fine)
                 if ids:
                     if 'fine_snapshot' not in journal:
                         journal['fine_snapshot'] = validation.snapshot_fine(fine)
@@ -145,51 +470,108 @@ def execute(args, folder, export_cmd, merge_cmd, run, gate, gate_cmd, resolve):
                         command += ['--expect-company', args.erp_expect_company]
                     if args.erp_bridge_url:
                         command += ['--bridge-url', args.erp_bridge_url]
-                    if (fine.parent/'聚水潭订单'/(args.company_name+'_聚水潭订单.state.json')).exists():
+                    erp_runtime = runtime_for(fine.parent/'聚水潭订单'/(args.company_name+'_聚水潭订单'))
+                    erp_state = erp_runtime/'export.state.json'
+                    if erp_state.exists():
                         command.append('--resume')
                     report = None
                     if erp_result.exists():
                         candidate = json.loads(erp_result.read_text(encoding='utf-8'))
                         proof = candidate.get('receipt', {})
-                        output = Path(candidate.get('output', ''))
                         if (proof.get('shop') == args.company_name and proof.get('fine') == str(fine.resolve())
                                 and proof.get('order_ids') == ids
                                 and proof.get('fine_before_sha256') == receipt['files'][fine.name]
                                 and proof.get('fine_after_sha256') == digest(fine)
-                                and output.is_file() and proof.get('output_sha256') == digest(output)):
+                                and valid_erp_outputs(candidate)): 
                             report = candidate
                     if report is None:
                         if digest(fine) != receipt['files'][fine.name]:
                             raise ValueError('罚款商品字段已变化但无有效ERP完成凭证；请核实外部备份后恢复原罚款再 --resume，不猜测中断改动')
-                        rc = run(command)
+                        # Offline plan first; browser recovery belongs to the actual agent.
+                        prepare = command[:]
+                        result_index = prepare.index('--result-file')
+                        del prepare[result_index:result_index+2]
+                        rc = progress.call('erp_prepare', run, prepare + ['--prepare-only','--fine-export-succeeded'])
                         if rc:
-                            print('账单完成，ERP匹配未完成；同一命令 --resume，不重导账单', file=sys.stderr)
                             return rc
+                        offline_resume = False
+                        if args.resume and '--resume' in command:
+                            exporter = load_module(jst_script.with_name('jst_export.py'), 'company_erp_preflight')
+                            try:
+                                offline_resume = exporter.can_resume_offline(erp_state, ids, erp_runtime/'orders')
+                            except exporter.ExportError as exc:
+                                diagnostic = exporter.export_error_diagnostic(exc)
+                                print(json.dumps({'ok':False, 'error_code':diagnostic['code'],
+                                    'export_recovery':diagnostic['recovery'],
+                                    'error_details':diagnostic['details']}, ensure_ascii=False), flush=True)
+                                return 2
+                        if not offline_resume:
+                            session_command = [sys.executable,str(jst_script.with_name('jst_session.py')),
+                                '--transport',args.erp_transport,'--browser',args.erp_browser,'--wait','1']
+                            if getattr(args,'erp_expect_company',None):
+                                session_command += ['--expect-company',args.erp_expect_company]
+                            if args.erp_bridge_url:
+                                session_command += ['--bridge-url',args.erp_bridge_url]
+                            rc, readiness = progress.call('erp_session', gate, session_command)
+                            if rc or readiness.get('ok') is not True:
+                                print(json.dumps({'company':args.company_name,'stage':'erp_preparation_required',
+                                    **erp_recovery_status(readiness), 'matching_status':'not_started',
+                                    'recovery':readiness,'resume':'原命令 --resume；不重导账单，不切换下一家公司'},ensure_ascii=False),flush=True)
+                                return rc or 3
+                        if getattr(args, 'erp_scope_approval_file', None):
+                            command += ['--scope-approval-file', str(args.erp_scope_approval_file)]
+                        rc = progress.call('erp', run, command)
+                        if rc:
+                            recovery = erp_failure_recovery(erp_result, erp_state,
+                                jst_script.with_name('jst_scope_approval.py'), ids)
+                            recovered = resume_proven_partner(recovery, command,
+                                consent=getattr(args, 'erp_proven_partner_consent', False),
+                                explicit_approval=getattr(args, 'erp_scope_approval_file', None),
+                                run=run, progress=progress)
+                            if recovered is not None:
+                                rc = recovered
+                            if rc:
+                                # Re-read exact current result after the bounded attempt.
+                                recovery = erp_failure_recovery(erp_result, erp_state,
+                                    jst_script.with_name('jst_scope_approval.py'), ids)
+                                print(json.dumps({'company': args.company_name,
+                                    'stage': 'erp_recovery_required', 'recovery': recovery},
+                                    ensure_ascii=False), flush=True)
+                                print('账单完成，ERP匹配未完成；同一命令 --resume，不重导账单', file=sys.stderr)
+                                return rc
                         report = json.loads(erp_result.read_text(encoding='utf-8'))
                     proof = report.get('receipt', {})
-                    exported = Path(report.get('output', ''))
                     if (proof.get('shop') != args.company_name or proof.get('fine') != str(fine.resolve())
                             or proof.get('order_ids') != ids
                             or proof.get('fine_after_sha256') != digest(fine)
                             or proof.get('fine_before_sha256') != receipt['files'][fine.name]
-                            or not exported.is_file() or proof.get('output_sha256') != digest(exported)):
+                            or not valid_erp_outputs(report)):
                         raise ValueError('ERP结果凭证与本次文件不符；不进入合并')
+                    journal['erp_outputs'] = proof['outputs_sha256']
                     journal['fine_validation'] = validation.validate_fine(fine, journal['fine_snapshot'])
                     # Whitelist report fields; never persist network envelopes/URLs.
                     journal['erp'] = {key: report[key] for key in
-                                      ('ok','complete','missing_ids','matching') if key in report}
+                                      ('ok','complete','execution_status','matching_status','review_summary','missing_ids','matching') if key in report}
                     journal['hashes'][fine.name] = digest(fine)
                 else:
-                    journal['erp'] = {'skipped': 'no_order_id'}
+                    journal['erp'] = {'skipped': 'no_order_id','execution_status':'skipped','matching_status':'not_applicable'}
             elif result.get('status') == 'zero':
-                journal['erp'] = {'skipped': 'confirmed_zero'}
+                journal['erp'] = {'skipped': 'confirmed_zero','execution_status':'skipped','matching_status':'not_applicable'}
             else:
-                journal['erp'] = {'skipped': 'not_exported_this_run'}
+                journal['erp'] = {'skipped': 'not_exported_this_run','execution_status':'skipped','matching_status':'not_applicable'}
             journal['stage'] = 'erp_done'; save(journal_path, journal)
-        if merge_cmd and journal['stage'] == 'erp_done':
-            rc = run(merge_cmd)
+        if merge_cmd and journal['stage'] in ('erp_done','merge_running'):
+            settlement = args.settlement_date or f'{args.write_off_start}_{args.write_off_end}'
+            planned_output = (args.output_dir.expanduser().resolve() if args.output_dir else folder.parent) / (args.company_name+'_'+settlement+'.xlsx')
+            if planned_output.exists():
+                raise ValueError('合并前发现无已核实摘要的主表；可能合并中断或外部文件，停止以免覆盖，请核实恢复')
+            journal['stage'] = 'merge_running'; save(journal_path,journal)
+            rc = progress.call('merge', run, merge_cmd)
             if rc:
                 return rc
+            settlement = args.settlement_date or f'{args.write_off_start}_{args.write_off_end}'
+            merged_output = (args.output_dir.expanduser().resolve() if args.output_dir else folder.parent) / (args.company_name+'_'+settlement+'.xlsx')
+            journal['merged_sha256'] = digest(merged_output)
             journal['stage'] = 'merged'; save(journal_path, journal)
         if merge_cmd:
             settlement = args.settlement_date or f'{args.write_off_start}_{args.write_off_end}'
@@ -203,9 +585,57 @@ def execute(args, folder, export_cmd, merge_cmd, run, gate, gate_cmd, resolve):
                 template = candidates[0]
             if journal['stage'] == 'complete' and digest(output) != journal.get('main_sha256'):
                 raise ValueError('已交付主表已被外部更改；不自动覆盖')
-            journal['validation'] = validation.validate_inventory(output,args.company_name,folder,template)
+            if journal['stage'] == 'merged':
+                # Do not re-merge on engine failure; preserve the uncalculated main file.
+                if digest(output) != journal.get('merged_sha256'):
+                    raise ValueError('合并主表无有效摘要或已被外部更改；不自动覆盖')
+                journal['validation'] = progress.call('inventory_validation', validation.validate_inventory, output,args.company_name,folder,template)
+                enrichment = load_module(Path(__file__).with_name('delivery_enrichment.py'), 'delivery_enrichment')
+                journal['delivery'] = progress.call('delivery_recalculation', enrichment.enrich, output, journal.get('erp'),
+                    folder/fine_names[0] if fine_names else None, state_root, receipt=receipt, progress=progress.set_stage)
+                journal['candidate_sha256'] = digest(journal['delivery']['candidate'])
+                journal['stage'] = 'delivery_prepared'; save(journal_path, journal)
+            if journal['stage'] == 'delivery_prepared':
+                progress.set_stage('publication')
+                expected = journal['candidate_sha256']
+                current = digest(output)
+                if current != expected:
+                    if current != journal['merged_sha256']:
+                        raise ValueError('发布前主表已被外部更改；不自动覆盖')
+                    candidate = Path(journal['delivery']['candidate'])
+                    if digest(candidate) != expected:
+                        raise ValueError('重算候选文件已变化；拒绝发布')
+                    import tempfile, shutil
+                    fd, name = tempfile.mkstemp(prefix='.delivery-',suffix='.xlsx',dir=output.parent)
+                    os.close(fd)
+                    temp = Path(name)
+                    try:
+                        shutil.copyfile(candidate,temp)
+                        if digest(output) != current:
+                            raise ValueError('发布时主表被外部更改')
+                        os.replace(temp,output)
+                    finally:
+                        temp.unlink(missing_ok=True)
+                journal['main_sha256'] = expected
+                journal['stage'] = 'enriched'; save(journal_path, journal)
+            if journal['stage'] == 'enriched' and digest(output) != journal.get('main_sha256'):
+                raise ValueError('重算后主表已被外部更改；不自动覆盖')
+            # Lean deliveries reuse the pre-enrichment inventory check: cache-only
+            # transfer preserves its cells and publication verifies its exact hash.
+            # Legacy/interrupted journals without that evidence still get one check.
+            if (journal.get('delivery', {}).get('validation_profile') != 'lean'
+                    or journal.get('validation', {}).get('ok') is not True):
+                journal['validation'] = progress.call('final_validation', validation.validate_inventory, output,args.company_name,folder,template)
             journal['main_sha256'] = digest(output)
         journal['stage'] = 'complete'; save(journal_path,journal)
-        print(json.dumps({'company':args.company_name,'stage':'complete','erp':journal.get('erp'),
-                          'validation':journal.get('validation')},ensure_ascii=False))
+        summary = delivery_summary(journal, folder, output if merge_cmd else None)
+        erp = journal.get('erp') or {}
+        matching = erp.get('matching') or {}
+        print(json.dumps({'company':args.company_name,'stage':'complete',
+                          'execution_status':'completed', 'conclusion':summary['conclusion'],
+                          'erp':{key:erp[key] for key in ('ok','complete','execution_status','matching_status','review_summary','missing_ids','skipped') if key in erp},
+                          'matching':{key:matching[key] for key in ('counts','reason_counts') if key in matching},
+                          'delivery':journal.get('delivery'),
+                          'validation':journal.get('validation'),
+                          'summary':summary},ensure_ascii=False),flush=True)
         return 0

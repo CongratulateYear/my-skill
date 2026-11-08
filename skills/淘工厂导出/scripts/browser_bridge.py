@@ -29,7 +29,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, parse_qs
 from urllib.request import Request, build_opener
 
 DEFAULT_PORT = 8899
@@ -83,18 +83,41 @@ class _Bridge:
         self.tasks: queue.Queue[_Task | None] = queue.Queue(maxsize=64)
         self.pending: dict[str, _Task] = {}
         self.lock = threading.Lock()
+        self.changed = threading.Condition(self.lock)
+        self.agent_id = ""
         self.last_seen = 0.0
         self.document_cookie = ""
         self.page_url = ""
         self.done_count = 0
         self.errors: list[str] = []
 
-    def note_agent(self) -> None:
-        self.last_seen = time.monotonic()
+    def note_agent(self, agent_id: str, session: dict[str, Any]) -> bool:
+        if not agent_id or len(agent_id) > 100:
+            return False
+        with self.changed:
+            if self.agent_id and self.agent_id != agent_id and self.agent_attached:
+                return False
+            if self.agent_id != agent_id:
+                # Requests for the old page must never migrate to a new page.
+                for task in self.pending.values():
+                    task.error = "页面代理已更换；请重新验证账号"
+                    task.done.set()
+                self.pending.clear()
+                while True:
+                    try:
+                        self.tasks.get_nowait()
+                    except queue.Empty:
+                        break
+                self.agent_id = agent_id
+            self.document_cookie = str(session.get("cookie") or "")
+            self.page_url = str(session.get("href") or "")
+            self.last_seen = time.monotonic()
+            self.changed.notify_all()
+        return True
 
     @property
     def agent_attached(self) -> bool:
-        return (time.monotonic() - self.last_seen) < POLL_WAIT_SECONDS + 15
+        return bool(self.agent_id) and (time.monotonic() - self.last_seen) < POLL_WAIT_SECONDS + 15
 
 
 BRIDGE = _Bridge()
@@ -155,14 +178,17 @@ class _Handler(BaseHTTPRequestHandler):
             return
         path = urlsplit(self.path).path
         if path == "/ping":
-            self._json(200, {
-                "ok": True,
-                "agentAttached": BRIDGE.agent_attached,
-                "done": BRIDGE.done_count,
-                "page": BRIDGE.page_url,
-            })
+            with BRIDGE.lock:
+                self._json(200, {
+                    "ok": True,
+                    "agentAttached": BRIDGE.agent_attached,
+                    "done": BRIDGE.done_count,
+                    "page": BRIDGE.page_url, "agentId": BRIDGE.agent_id,
+                })
         elif path == "/session":
-            self._json(200, {"cookie": BRIDGE.document_cookie, "page": BRIDGE.page_url})
+            with BRIDGE.lock:
+                self._json(200, {"cookie": BRIDGE.document_cookie, "page": BRIDGE.page_url,
+                                 "agentId": BRIDGE.agent_id})
         elif path == "/agent.js":
             try:
                 text = AGENT_FILE.read_text(encoding="utf-8")
@@ -171,29 +197,39 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             self._send(200, text.encode("utf-8"), "application/javascript; charset=utf-8")
         elif path == "/next":
-            BRIDGE.note_agent()
-            wait = POLL_WAIT_SECONDS
-            query = urlsplit(self.path).query
-            if "wait=" in query:
-                try:
-                    wait = min(max(float(query.split("wait=")[1].split("&")[0]), 1.0), 60.0)
-                except (ValueError, IndexError):
-                    pass
+            query = parse_qs(urlsplit(self.path).query)
+            agent_id = query.get("agentId", [""])[0]
+            try:
+                wait = min(max(float(query.get("wait", [POLL_WAIT_SECONDS])[0]), 1.0), 60.0)
+            except (ValueError, TypeError):
+                wait = POLL_WAIT_SECONDS
             deadline = time.monotonic() + wait
-            while True:
-                try:
-                    task = BRIDGE.tasks.get(timeout=max(deadline - time.monotonic(), 0.001))
-                except queue.Empty:
-                    self._send(204, b"")
+            with BRIDGE.changed:
+                if not agent_id or agent_id != BRIDGE.agent_id or not BRIDGE.agent_attached:
+                    self._json(409, {"ok": False, "error": "代理不匹配"})
                     return
-                if task is None:
-                    self._send(204, b"")
-                    return
-                with BRIDGE.lock:
-                    active = str(id(task)) in BRIDGE.pending
-                if active:
-                    self._json(200, {"taskId": id(task), **task.spec})
-                    return
+                BRIDGE.last_seen = time.monotonic()
+                while True:
+                    # Check ownership and dequeue atomically, even after a long poll wakes.
+                    if BRIDGE.agent_id != agent_id:
+                        self._json(409, {"ok": False, "error": "代理已更换"})
+                        return
+                    try:
+                        task = BRIDGE.tasks.get_nowait()
+                    except queue.Empty:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            self._send(204, b"")
+                            return
+                        BRIDGE.changed.wait(remaining)
+                        continue
+                    if task is None:
+                        self._send(204, b"")
+                        return
+                    if (BRIDGE.pending.get(task.spec["taskId"]) is task
+                            and task.spec.get("agentId") == agent_id):
+                        self._json(200, task.spec)
+                        return
         else:
             self._json(404, {"ok": False, "error": "unknown path"})
 
@@ -207,46 +243,58 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/next":
             self._json(404, {"ok": False})
         elif path == "/result":
-            task = None
+            agent_id = str(payload.get("agentId") or "")
             with BRIDGE.lock:
-                task = BRIDGE.pending.pop(str(payload.get("taskId") or ""), None)
-            if task is not None:
+                task_id = str(payload.get("taskId") or "")
+                task = BRIDGE.pending.get(task_id)
+                if (not agent_id or agent_id != BRIDGE.agent_id or not BRIDGE.agent_attached
+                        or task is None or task.spec.get("agentId") != agent_id):
+                    self._json(409, {"ok": False, "error": "任务代理不匹配或任务已失效"})
+                    return
+                BRIDGE.pending.pop(task_id)
                 if payload.get("ok"):
                     task.result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
                 else:
                     task.error = str(payload.get("error") or "页面执行失败")
                 task.done.set()
-            BRIDGE.done_count += 1
+                BRIDGE.done_count += 1
             self._json(200, {"ok": True})
         elif path == "/session":
-            BRIDGE.note_agent()
-            BRIDGE.document_cookie = str(payload.get("cookie") or "")
-            BRIDGE.page_url = str(payload.get("href") or "")
+            if not BRIDGE.note_agent(str(payload.get("agentId") or ""), payload):
+                self._json(409, {"ok": False, "error": "已有另一个页面代理；停止旧代理后重试"})
+                return
             self._json(200, {"ok": True})
         elif path == "/log":
-            message = str(payload.get("message") or "")[:400]
-            BRIDGE.errors = (BRIDGE.errors + [message])[-20:]
-            BRIDGE.note_agent()
+            with BRIDGE.lock:
+                if (not payload.get("agentId") or payload["agentId"] != BRIDGE.agent_id
+                        or not BRIDGE.agent_attached):
+                    self._json(409, {"ok": False, "error": "代理不匹配"})
+                    return
+                message = str(payload.get("message") or "")[:400]
+                BRIDGE.errors = (BRIDGE.errors + [message])[-20:]
+                BRIDGE.last_seen = time.monotonic()
             self._json(200, {"ok": True})
         elif path == "/call":
-            if not BRIDGE.agent_attached:
-                self._json(503, {"ok": False, "error": AGENT_HINT})
-                return
-            task = _Task(payload)
-            with BRIDGE.lock:
-                BRIDGE.pending[str(id(task))] = task
-            task.spec["taskId"] = id(task)
-            try:
-                BRIDGE.tasks.put(task, timeout=5)
-            except queue.Full:
-                with BRIDGE.lock:
-                    BRIDGE.pending.pop(str(id(task)), None)
-                self._json(503, {"ok": False, "error": "任务队列已满，页面代理可能卡住"})
-                return
+            with BRIDGE.changed:
+                if not BRIDGE.agent_attached:
+                    self._json(503, {"ok": False, "error": AGENT_HINT})
+                    return
+                if not payload.get("agentId") or payload["agentId"] != BRIDGE.agent_id:
+                    self._json(409, {"ok": False, "error": "代理已改变；请重新验证账号"})
+                    return
+                task = _Task({**payload, "taskId": uuid.uuid4().hex})
+                task_id = task.spec["taskId"]
+                try:
+                    BRIDGE.tasks.put_nowait(task)
+                except queue.Full:
+                    self._json(503, {"ok": False, "error": "任务队列已满，页面代理可能卡住"})
+                    return
+                BRIDGE.pending[task_id] = task
+                BRIDGE.changed.notify_all()
             timeout = float(payload.get("timeout") or CALL_TIMEOUT)
             finished = task.done.wait(timeout=max(min(timeout, 900.0), 1.0))
             with BRIDGE.lock:
-                BRIDGE.pending.pop(str(id(task)), None)
+                BRIDGE.pending.pop(task_id, None)
             if not finished:
                 self._json(504, {"ok": False, "error": f"页面 {timeout:.0f}s 内没有回包"})
             elif task.error:
@@ -312,6 +360,7 @@ class BridgeClient:
         self.port = port
         self.base = f"http://{DEFAULT_HOST}:{port}"
         self._inner = build_opener()
+        self.agent_id: str | None = None
         if ensure and not ping(port).get("ok"):
             ensure_running(port)
 
@@ -327,14 +376,23 @@ class BridgeClient:
                     f"python scripts/browser_bridge.py --port {self.port}"
                 )
             if state.get("agentAttached"):
+                agent_id = state.get("agentId")
+                if not agent_id or (self.agent_id and self.agent_id != agent_id):
+                    raise BridgeError("代理已改变；请重新验证账号（协议升级须重启桥并重新注入代理）")
+                self.agent_id = agent_id
                 return state
             if time.monotonic() >= deadline:
                 raise BridgeAgentMissing(AGENT_HINT)
             time.sleep(1.0)
 
     def session_info(self) -> dict[str, Any]:
+        if not self.agent_id:
+            self.wait_ready(0)
         with self._inner.open(self.base + "/session", timeout=5) as response:
-            return json.loads(response.read().decode("utf-8"))
+            info = json.loads(response.read().decode("utf-8"))
+            if info.get("agentId") != self.agent_id:
+                raise BridgeError("代理已改变；请重新验证账号")
+            return info
 
     def account_hint(self) -> str:
         return account_hint_from_cookie(self.session_info().get("cookie", ""))
@@ -362,6 +420,9 @@ class BridgeClient:
 
     # -------------------------------------------------------------- 请求
     def _call(self, spec: dict[str, Any]) -> dict[str, Any]:
+        if not self.agent_id:
+            self.wait_ready(0)
+        spec = {**spec, "agentId": self.agent_id}
         body = json.dumps(spec, ensure_ascii=False).encode("utf-8")
         request = Request(
             f"{self.base}/call",

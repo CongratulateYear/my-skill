@@ -7,6 +7,7 @@ No response body, download URL, or authentication material is persisted or repor
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import math
 import os
@@ -46,12 +47,22 @@ def _created_timestamp(value):
 
 class ExportError(RuntimeError):
     """Safe diagnostic; never includes a server body or signed URL."""
+    def __init__(self, message, *, code="export_schema_invalid", recovery=None, details=None):
+        super().__init__(message)
+        self.code = code
+        self.recovery = recovery or {"action": "inspect-and-resume", "requiredResume": True}
+        self.details = details or {}
+
+    def safe_diagnostic(self):
+        return export_error_diagnostic(self)
+
 
 
 class MissingOrdersError(ExportError):
     def __init__(self, missing):
         self.missing = list(missing)
-        super().__init__("查询缺失订单: " + ", ".join(self.missing))
+        super().__init__("查询缺失订单（订单集合见安全诊断）", code="missing_orders",
+                         details={"missing_ids": self.missing})
 
 
 @dataclass(frozen=True)
@@ -120,6 +131,27 @@ def _json_decode(text):
     return json.loads(text, parse_int=str, parse_float=Decimal)
 
 
+def _diagnostic_type(value):
+    """Static shape only: never a class name, response value, or arbitrary key."""
+    if value is None:
+        return "null"
+    if type(value) is bool:
+        return "boolean"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, dict):
+        return "object"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, (int, float, Decimal)):
+        return "number"
+    return "unknown"
+
+
+def _parse_details(step, reason, value):
+    return {"parse_step": step, "reason": reason, "type": _diagnostic_type(value)}
+
+
 def _decode(value):
     """Unwrap JSON strings and documented-style callback length framing.
 
@@ -131,7 +163,8 @@ def _decode(value):
             return value
         text = value.strip().lstrip("\ufeff")
         if not text or text.startswith("<"):
-            raise ExportError("回调返回 HTML/空内容，可能登录失效")
+            raise ExportError("回调返回 HTML/空内容，可能登录失效",
+                              details=_parse_details("decode", "html_or_empty", value))
         try:
             value = _json_decode(text)
             continue
@@ -142,15 +175,31 @@ def _decode(value):
             count = int(match.group(1))
             rest = text[match.end():]
             if count > len(rest):
-                raise ExportError("回调 length framing 长度不匹配")
+                raise ExportError("回调 length framing 长度不匹配",
+                                  details=_parse_details("decode", "framing_length_mismatch", value))
             if count == len(rest):
                 value = rest
             else:
                 # Standard WebForms callback event-validation prefix.
                 value = rest[count:]
             continue
-        raise ExportError("回调不是可识别 JSON/length framing")
-    raise ExportError("回调嵌套层数过深")
+        raise ExportError("回调不是可识别 JSON/length framing",
+                          details=_parse_details("decode", "unrecognized_encoding", value))
+    raise ExportError("回调嵌套层数过深",
+                      details=_parse_details("decode", "nesting_limit", value))
+
+
+def _envelope_reason(value, fallback):
+    """Classify known server markers without exposing their contents."""
+    if type(value) is dict:
+        message = value.get("Message")
+        if type(message) is str and "910001" in message:
+            return "sms_confirmation_marker"
+        if message == "not_logged_in":
+            return "not_logged_in_marker"
+        if value.get("ExceptionMessage"):
+            return "exception_message_present"
+    return fallback
 
 
 def _unwrap(response):
@@ -159,30 +208,38 @@ def _unwrap(response):
         value = _decode(value)
         if value is None or isinstance(value, str):
             return value
+        if type(value) is bool:
+            return value
         if not isinstance(value, dict):
-            raise ExportError("回调数据结构无法识别")
+            raise ExportError("回调数据结构无法识别",
+                              details=_parse_details("unwrap", "unsupported_type", value))
         for key in ("Error", "error", "Exception", "exception", "ErrorMessage"):
             if value.get(key):
-                raise ExportError("服务器返回错误包（详情已隐藏）")
+                raise ExportError("服务器返回错误包（详情已隐藏）",
+                                  details=_parse_details("unwrap", _envelope_reason(value, "server_error"), value))
         for key in ("Success", "success", "IsSuccess"):
             if key in value and value[key] in (False, "false", "False", "0", 0):
-                raise ExportError("服务器明确报告失败")
+                raise ExportError("服务器明确报告失败",
+                                  details=_parse_details("unwrap", _envelope_reason(value, "explicit_failure"), value))
         if "ReturnValue" in value:
             returned = value["ReturnValue"]
             if returned is None:
                 if value.get("IsSuccess") is not True:
-                    raise ExportError("空 ReturnValue 未明确报告 IsSuccess=true")
+                    raise ExportError("空 ReturnValue 未明确报告 IsSuccess=true",
+                                      details=_parse_details("return_value", _envelope_reason(value, "success_not_confirmed"), returned))
                 return None
             if isinstance(returned, str) and returned.startswith("https://"):
                 if value.get("IsSuccess") is not True:
-                    raise ExportError("下载回调未明确报告成功")
+                    raise ExportError("下载回调未明确报告成功",
+                                      details=_parse_details("return_value", _envelope_reason(value, "success_not_confirmed"), returned))
                 return returned
             value = returned
         elif "d" in value and len(value) == 1:
             value = value["d"]
         else:
             return value
-    raise ExportError("回调 envelope 嵌套过深")
+    raise ExportError("回调 envelope 嵌套过深",
+                      details=_parse_details("unwrap", "nesting_limit", value))
 
 
 def _callback(session, headers, url, hidden, method, args, *, callback_id="JTable1",
@@ -196,9 +253,21 @@ def _callback(session, headers, url, hidden, method, args, *, callback_id="JTabl
     if poll:
         form["__VIEWSTATE_DEL"] = form.get("__VIEWSTATE", "")
         form["__VIEWSTATE"] = ""
-    response = _request(session, "post", url, headers=dict(headers), data=form,
-                        params={"ts___": str(time.time_ns() // 1_000_000), "am___": method}, timeout=timeout)
-    return _unwrap(response)
+    export_step = {"ExportCheckConfirm": "check_confirmation", "ExportBySync": "create"}.get(method)
+    try:
+        response = _request(session, "post", url, headers=dict(headers), data=form,
+                            params={"ts___": str(time.time_ns() // 1_000_000), "am___": method}, timeout=timeout)
+    except ExportError as error:
+        if export_step:
+            error.details = dict(error.details, export_step=export_step, parse_step="request",
+                                 reason="request_failed", type="unknown")
+        raise
+    try:
+        return _unwrap(response)
+    except ExportError as error:
+        if export_step:
+            error.details = dict(error.details, export_step=export_step)
+        raise
 
 
 def _identifier(value, label):
@@ -209,6 +278,23 @@ def _identifier(value, label):
     if not value or any(x in value for x in (",", "\r", "\n", "\x00")):
         raise ExportError(label + "为空或包含非法分隔符")
     return value
+
+
+def _row_order_ids(value, *, merged=False):
+    """Decimal components, with decimal internal prefixes only for explicit merges."""
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        raise ExportError("响应订单号不是精确字符串/整数")
+    text = str(value).strip()
+    pattern = r"[0-9]+(?::[0-9]+)?(?:,[0-9]+(?::[0-9]+)?)*" if merged else r"[0-9]+"
+    if not re.fullmatch(pattern, text):
+        raise ExportError("响应订单号或合单前缀格式无效")
+    return list(dict.fromkeys(part.rsplit(":", 1)[-1] for part in text.split(",")))
+
+
+def _merge_flag(row):
+    return (type(row.get("is_merge")) in (bool, int, str) and
+            row.get("is_merge") in (True, 1, "1", "true", "True") and
+            isinstance(row.get("order_from"), str) and "MERGE" in row["order_from"])
 
 
 def normalize_order_ids(order_ids):
@@ -229,6 +315,7 @@ def query_orders(session, headers, order_ids, hidden, *, schema=ResponseSchema()
     ids = normalize_order_ids(order_ids)
     found, internal, seen, pages = set(), [], set(), set()
     total_seen = None
+    merge_evidence, internal_order_ids = {}, {}
     for page in range(1, max_pages + 1):
         data = _callback(session, headers, EXPORT_URL, hidden, "LoadDataToJSON",
                          [str(page), _filter("so_id", ids), "{}"], timeout=timeout)
@@ -263,11 +350,20 @@ def query_orders(session, headers, order_ids, hidden, *, schema=ResponseSchema()
         for row in rows:
             if not isinstance(row, dict):
                 raise ExportError("订单行不是对象")
-            so_id = _identifier(row.get(schema.order_id_field), "响应订单号")
+            merged = _merge_flag(row)
+            so_ids_row = _row_order_ids(row.get(schema.order_id_field), merged=merged)
             o_id = _identifier(row.get(schema.internal_id_field), "内部订单号")
-            if so_id not in ids:
+            matched = [x for x in so_ids_row if x in ids]
+            if not matched:
                 raise ExportError("响应包含筛选范围外订单，停止导出")
-            found.add(so_id)
+            canonical = sorted(so_ids_row)
+            if o_id in internal_order_ids and (internal_order_ids[o_id] != canonical or
+                                              (o_id in merge_evidence) != merged):
+                raise ExportError("同一内部订单的线上订单证据矛盾")
+            internal_order_ids[o_id] = canonical
+            if merged:
+                merge_evidence[o_id] = canonical
+            found.update(matched)
             if o_id not in seen:
                 seen.add(o_id)
                 internal.append(o_id)
@@ -294,7 +390,8 @@ def query_orders(session, headers, order_ids, hidden, *, schema=ResponseSchema()
     if missing and not allow_missing:
         raise MissingOrdersError(missing)
     if return_details:
-        return {"internal_ids": internal, "found_ids": [x for x in ids if x in found], "missing_ids": missing}
+        return {"internal_ids": internal, "found_ids": [x for x in ids if x in found], "missing_ids": missing,
+                "merge_evidence": merge_evidence, "internal_order_ids": internal_order_ids}
     return internal
 
 
@@ -309,22 +406,39 @@ def create_export(session, headers, hidden, internal_ids, *, schema=ResponseSche
                   before_create=None):
     """Check only, durably mark uncertain creation, then issue the live create call.
 
-    ReturnValue=null is normal for both callbacks; RequestId is transport metadata.
+    The live _ACP helper dispatches via JTable1/{page}, not ACall1.
+    Checks may return null/bool; creation may return null (legacy) or true.
+    RequestId is transport metadata, never the export task id.
     before_create MUST persist intent before ExportBySync can reach the network.
     """
     count = str(len(internal_ids))
     args = [_filter("o_id", internal_ids), count, "true", "false", "false"]
+    # Verified against the current live page's _ACP helper.
     checked = _callback(session, headers, EXPORT_URL, hidden, "ExportCheckConfirm", args,
-                        control="{page}", timeout=timeout)
-    if checked is not None:
-        raise ExportError("ExportCheckConfirm 返回未知结构；未创建任务")
+                        callback_id="JTable1", control="{page}", timeout=timeout)
+    if checked is True:
+        raise ExportError("ExportCheckConfirm 要求确认手机号导出消费；未创建任务",
+                          code="export_confirmation_required",
+                          details=dict(_parse_details("create_return", "confirmation_required", checked),
+                                       export_step="check_confirmation"))
+    if checked is not None and checked is not False:
+        raise ExportError("ExportCheckConfirm 返回未知结构；未创建任务",
+                          details=dict(_parse_details("create_return", _envelope_reason(checked, "unexpected_return"), checked),
+                                       export_step="check_confirmation"))
     if before_create is None:
         raise ExportError("创建任务必须先持久化状态")
     before_create()
     created = _callback(session, headers, EXPORT_URL, hidden, "ExportBySync", args + [None],
-                        control="{page}", timeout=timeout)
-    if created is not None:
-        raise ExportError("ExportBySync 返回未知结构；创建结果不确定，请续跑")
+                        callback_id="JTable1", control="{page}", timeout=timeout)
+    if created is False:
+        raise ExportError("ExportBySync 返回 false；未确认创建，保留状态核查",
+                          code="export_creation_not_confirmed",
+                          details=dict(_parse_details("create_return", "creation_not_confirmed", created),
+                                       export_step="create"))
+    if created is not None and created is not True:
+        raise ExportError("ExportBySync 返回未知结构；创建结果不确定，请续跑",
+                          details=dict(_parse_details("create_return", _envelope_reason(created, "unexpected_return"), created),
+                                       export_step="create"))
 
 
 def _task_id(value):
@@ -373,15 +487,15 @@ def poll_export(session, headers, request_id, *, schema=ResponseSchema(), max_po
     task = _task_id(request_id)
     hidden = get_hidden(session, headers, LOG_URL, timeout)
     for index in range(max_polls):
-        data = _callback(session, headers, LOG_URL, hidden, "GetExportData", [task],
-                         callback_id="ACall1", control="{page}", poll=True, timeout=timeout)
+        data = _callback(session, headers, LOG_URL, hidden, "CheckAndGetExportData", [task],
+                         callback_id="JTable1", control="{page}", timeout=timeout)
         if isinstance(data, str):
             return validate_download_url(data) if urlsplit(data).hostname in ("www.erp321.com", "erp321.com") else data
         if data is not None:
             raise ExportError("GetExportData 返回未知结构；未猜测状态或 URL")
         if index + 1 < max_polls:
             sleep(poll_interval)
-    raise ExportError("导出任务轮询超时；状态已保存，请续跑")
+    raise ExportError("导出任务轮询超时；状态已保存，请续跑", code="poll_limit_exceeded")
 
 
 def validate_download_url(url, extra_domains=()):
@@ -396,7 +510,7 @@ def validate_download_url(url, extra_domains=()):
         raise ExportError("下载只允许无用户凭据的标准 HTTPS URL")
     allowed = ("erp321.com", "jushuitan.com") + tuple(extra_domains)
     if not any(host == d.lower() or host.endswith("." + d.lower()) for d in allowed if d):
-        raise ExportError("下载域不在显式允许列表")
+        raise ExportError("下载域不在显式允许列表", code="download_domain_rejected")
     return url
 
 
@@ -438,7 +552,7 @@ def download_export(session, headers, url, *, extra_domains=(), timeout=60,
                 status, response_headers = response.status_code, getattr(response, "headers", {})
                 content = response.content
             except Exception:
-                raise ExportError("下载 transport 失败（详情已隐藏）") from None
+                raise ExportError("下载 transport 失败（详情已隐藏）", code="download_failed") from None
         else:
             safe_headers = {k: v for k, v in headers.items() if k.lower() in ("user-agent", "accept")}
             try:
@@ -446,7 +560,7 @@ def download_export(session, headers, url, *, extra_domains=(), timeout=60,
             except ExportError:
                 raise
             except Exception:
-                raise ExportError("无凭据下载 transport 失败（详情已隐藏）") from None
+                raise ExportError("无凭据下载 transport 失败（详情已隐藏）", code="download_failed") from None
         if status in (301, 302, 303, 307, 308):
             location = response_headers.get("Location") or response_headers.get("location")
             if not location:
@@ -456,9 +570,9 @@ def download_export(session, headers, url, *, extra_domains=(), timeout=60,
         if status != 200:
             raise ExportError("下载响应非 200")
         if not isinstance(content, bytes) or len(content) > max_bytes:
-            raise ExportError("下载文件超过大小限制或内容类型无效")
+            raise ExportError("下载文件超过大小限制或内容类型无效", code="download_limit_exceeded")
         return content
-    raise ExportError("下载重定向次数超限")
+    raise ExportError("下载重定向次数超限", code="download_limit_exceeded")
 
 
 def _check_zip(content, *, max_unpacked, max_members, max_ratio):
@@ -471,8 +585,10 @@ def _check_zip(content, *, max_unpacked, max_members, max_ratio):
         total = 0
         for info in infos:
             name = info.filename
+            original_name = info.orig_filename
             path = PurePosixPath(name)
-            if (name in names or name.startswith("/") or "\\" in name or ":" in name or
+            if ("\\" in original_name or original_name.startswith("/") or
+                    name in names or name.startswith("/") or "\\" in name or ":" in name or
                     ".." in path.parts or "\x00" in name or
                     stat.S_ISLNK(info.external_attr >> 16) or info.flag_bits & 1):
                 raise ExportError("ZIP 包含重复、危险路径、链接或加密成员")
@@ -637,7 +753,10 @@ def validate_order_coverage(content, expected_ids):
                         raise ExportError("工作簿订单号不是可靠文本/整数")
                     if isinstance(value, int) and len(str(abs(value))) > 15:
                         raise ExportError("工作簿长订单号为数值，可能丢失精度")
-                    actual.add(_identifier(value, "工作簿订单号"))
+                    order_id = _identifier(value, "工作簿订单号")
+                    if not re.fullmatch(r"[0-9]+", order_id):
+                        raise ExportError("工作簿订单号必须为十进制")
+                    actual.add(order_id)
             if not identified:
                 raise ExportError("工作簿缺少原始线上订单号列")
         except ExportError:
@@ -649,7 +768,11 @@ def validate_order_coverage(content, expected_ids):
                 wb.close()
     expected = set(expected_ids)
     if actual != expected:
-        raise ExportError("导出工作簿订单范围/覆盖不匹配；未接受任务文件")
+        extra, missing = sorted(actual - expected), sorted(expected - actual)
+        raise ExportError("导出工作簿订单范围/覆盖不匹配；未接受任务文件",
+                          code="order_coverage_mismatch",
+                          details={"actual_extra_ids": extra, "missing_ids": missing,
+                                   "actual-extra": extra, "missing": missing})
     return kind
 
 
@@ -690,9 +813,10 @@ def _load_state(path):
         state = json.loads(Path(path).read_text(encoding="utf-8"))
         required = {"version", "phase", "requested_ids", "found_ids", "missing_ids", "internal_ids",
                     "baseline_ids", "candidate_ids", "export_type", "output"}
-        optional = {"creation_window", "task_total_count"}
+        optional = {"creation_window", "task_total_count", "merge_evidence", "internal_order_ids",
+                    "pending", "download_attempted", "scope_exception"}
         if (not isinstance(state, dict) or not required <= set(state) or
-                set(state) - required - optional or state["version"] != 1):
+                set(state) - required - optional or type(state["version"]) is not int or state["version"] not in (1, 2)):
             raise ValueError()
         if "creation_window" in state:
             window = state["creation_window"]
@@ -721,9 +845,48 @@ def _load_state(path):
                 raise ValueError()
         if len(state["candidate_ids"]) > 1:
             raise ValueError()
+        _validate_state_bindings(state)
         return state
     except Exception:
-        raise ExportError("状态文件无效，禁止创建或猜测任务") from None
+        raise ExportError("状态文件无效，禁止创建或猜测任务", code="state_invalid") from None
+
+
+def _validate_state_bindings(state):
+    if not isinstance(state["output"], str) or not Path(state["output"]).is_absolute():
+        raise ValueError()
+    if state["version"] == 2:
+        for key in ("merge_evidence", "internal_order_ids"):
+            mapping = state.get(key)
+            if not isinstance(mapping, dict):
+                raise ValueError()
+            for internal, values in mapping.items():
+                if (internal not in state["internal_ids"] or not isinstance(values, list) or not values or
+                        any(type(x) is not str or not re.fullmatch(r"[0-9]+", x) for x in values) or
+                        values != sorted(set(values))):
+                    raise ValueError()
+        if set(state["internal_order_ids"]) != set(state["internal_ids"]):
+            raise ValueError()
+        for internal, values in state["merge_evidence"].items():
+            if values != state["internal_order_ids"][internal] or not set(values) & set(state["found_ids"]):
+                raise ValueError()
+        for internal, values in state["internal_order_ids"].items():
+            if internal not in state["merge_evidence"] and not set(values) <= set(state["requested_ids"]):
+                raise ValueError()
+    if "download_attempted" in state and state["download_attempted"] is not True:
+        raise ValueError()
+    if "pending" in state:
+        binding = state["pending"]
+        if (not isinstance(binding, dict) or set(binding) != {"task_id", "sha256", "output", "requested_ids"} or
+                len(state["candidate_ids"]) != 1 or binding["task_id"] != state["candidate_ids"][0] or
+                binding["output"] != state["output"] or binding["requested_ids"] != state["requested_ids"] or
+                not isinstance(binding["sha256"], str) or not re.fullmatch(r"[a-f0-9]{64}", binding["sha256"])):
+            raise ValueError()
+    if "scope_exception" in state:
+        approval = state["scope_exception"]
+        if (not isinstance(approval, dict) or "pending" not in state or
+                approval != dict(_approval_payload(state, state["pending"]["sha256"],
+                                 approval.get("extra_ids", [])), approved=True)):
+            raise ValueError()
 
 
 def _candidate_tasks(rows, state):
@@ -759,7 +922,7 @@ def _candidate_tasks(rows, state):
 def _run_export(session, headers, order_ids, output, *, schema=ResponseSchema(),
                max_pages=1000, max_polls=120, poll_interval=2, sleep=time.sleep,
                extra_domains=(), timeout=30, public_download=None, state_path=None,
-               resume=False, allow_missing=False, export_type=None):
+               resume=False, allow_missing=False, export_type=None, scope_approval=None):
     """Live export with a credential-free durable journal and exact XLSX coverage.
 
     Default journal: str(output)+".state.json". Resume MUST use identical requested
@@ -774,10 +937,33 @@ def _run_export(session, headers, order_ids, output, *, schema=ResponseSchema(),
     output = Path(output).absolute()
     state_path = Path(state_path or (str(output) + ".state.json")).absolute()
     ids = normalize_order_ids(order_ids)
+    if scope_approval is not None and not resume:
+        raise ExportError("范围授权只能用于已有任务续跑", code="scope_approval_invalid")
     typ = None if export_type is None else str(export_type)
-    if state_path == output or state_path in (output.with_suffix(".xlsx"), output.with_suffix(".zip")):
+    if (state_path == output or state_path in (output.with_suffix(".xlsx"), output.with_suffix(".zip")) or
+            _pending_path(state_path) in (output, output.with_suffix(".xlsx"), output.with_suffix(".zip"))):
         raise ExportError("状态文件与输出路径冲突")
-    if resume:
+    # Explicit operator-authorized replacement only: the old immutable journal
+    # must have been archived and bound by SHA-256. Ordinary resume never recreates.
+    import os
+    archived = os.environ.get('DSH_JST_AUTHORIZED_RECREATE_ARCHIVE')
+    authorized_new = False
+    if resume and not state_path.exists() and archived:
+        archive_path = Path(archived)
+        expected_sha = os.environ.get('DSH_JST_AUTHORIZED_RECREATE_SHA256', '')
+        if archive_path.is_symlink() or not archive_path.is_file():
+            raise ExportError('重建授权归档无效')
+        if hashlib.sha256(archive_path.read_bytes()).hexdigest() != expected_sha:
+            raise ExportError('重建授权归档哈希不符')
+        previous = _load_state(archive_path)
+        if (previous['requested_ids'] != ids or previous['output'] != str(output)
+                or previous['phase'] not in ('creating', 'created')
+                or previous.get('candidate_ids') or previous.get('pending')
+                or previous.get('download_attempted')
+                or _pending_path(archive_path).exists()):
+            raise ExportError('旧任务不满足显式重建约束')
+        authorized_new = True
+    if resume and not authorized_new:
         state = _load_state(state_path)
         if (state["requested_ids"] != ids or state["output"] != str(output) or
                 (typ is not None and state["export_type"] not in (None, typ))):
@@ -788,6 +974,12 @@ def _run_export(session, headers, order_ids, output, *, schema=ResponseSchema(),
         if state_path.exists() or state_path.is_symlink():
             raise ExportError("状态文件已存在；必须显式 resume，禁止重复创建任务")
         state = None
+        if _pending_path(state_path).exists() or _pending_path(state_path).is_symlink():
+            raise ExportError("发现孤立待验收文件；禁止创建任务或覆盖", code="pending_unbound")
+    if state is not None and not state.get("pending") and (_pending_path(state_path).exists() or _pending_path(state_path).is_symlink()):
+        raise ExportError("发现未绑定待验收文件；禁止覆盖或重新下载", code="pending_unbound")
+    if state is not None and state.get("download_attempted") and not state.get("pending"):
+        raise ExportError("下载已尝试但未取得已绑定文件；禁止自动重复下载", code="download_outcome_unknown")
     paths = [output] if output.suffix else [output, output.with_suffix(".xlsx"), output.with_suffix(".zip")]
     if any(p.exists() or p.is_symlink() for p in paths):
         # A crash after output commit but before complete journal can be resumed
@@ -799,7 +991,11 @@ def _run_export(session, headers, order_ids, output, *, schema=ResponseSchema(),
             content = handle.read(100 * 1024 * 1024 + 1)
         if len(content) > 100 * 1024 * 1024:
             raise ExportError("现有输出过大")
-        suffix = validate_order_coverage(content, state["found_ids"])
+        digest = hashlib.sha256(content).hexdigest()
+        if state.get("pending") and state["pending"]["sha256"] != digest:
+            raise ExportError("已发布文件哈希不一致", code="published_hash_mismatch")
+        suffix = _coverage_with_approval(content, state, digest,
+                                         scope_approval if scope_approval is not None else state.get("scope_exception"))
         if existing[0].suffix.lower() != suffix:
             raise ExportError("现有输出扩展名与内容不符")
         state["phase"] = "complete"
@@ -812,19 +1008,21 @@ def _run_export(session, headers, order_ids, output, *, schema=ResponseSchema(),
         if not details["internal_ids"]:
             raise MissingOrdersError(ids)
         baseline = list_export_tasks(session, headers, timeout=timeout, max_pages=max_pages)
-        state = dict(version=1, phase="prepared", requested_ids=ids, **details,
+        state = dict(version=2, phase="prepared", requested_ids=ids, **details,
                      baseline_ids=[_task_id(row["auto_id"]) for row in baseline], candidate_ids=[],
                      export_type=typ, output=str(output))
         _save_state(state_path, state, initial=True)
     if state["phase"] == "complete":
         raise ExportError("已完成状态的输出缺失；禁止重新创建任务")
-    if resume:
+    if resume and not state.get("pending") and not state.get("download_attempted"):
         hidden = get_hidden(session, headers, timeout=timeout)
         current = query_orders(session, headers, ids, hidden, schema=schema, max_pages=max_pages,
                                timeout=timeout, allow_missing=True, return_details=True)
         if (current["found_ids"] != state["found_ids"] or
                 current["missing_ids"] != state["missing_ids"] or
-                set(current["internal_ids"]) != set(state["internal_ids"])):
+                set(current["internal_ids"]) != set(state["internal_ids"]) or
+                (state["version"] == 2 and any(current[k] != state.get(k) for k in
+                  ("merge_evidence", "internal_order_ids")))):
             raise ExportError("续跑会话的订单/内部编号与状态不一致；可能账号已切换，停止")
     if state["phase"] == "prepared":
         hidden = get_hidden(session, headers, timeout=timeout)
@@ -860,19 +1058,110 @@ def _run_export(session, headers, order_ids, output, *, schema=ResponseSchema(),
                 sleep(poll_interval)
         else:
             raise ExportError("未发现唯一新任务；创建结果不确定，保留状态续跑，绝不重建")
+    return _accept_pending(session, headers, state, output, state_path,
+                           scope_approval=scope_approval, schema=schema, max_polls=max_polls,
+                           poll_interval=poll_interval, sleep=sleep, timeout=timeout,
+                           extra_domains=extra_domains, public_download=public_download)
+
+
+def _pending_path(state_path):
+    return Path(str(state_path) + ".pending")
+
+
+def _read_pending(path):
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > 100 * 1024 * 1024:
+        raise ExportError("待验收文件无效或缺失", code="pending_invalid")
+    return path.read_bytes()
+
+
+def _approval_payload(state, digest, extras):
+    return dict(approved=False, task_id=state["candidate_ids"][0], sha256=digest,
+                output=state["output"], requested_ids=state["requested_ids"], extra_ids=sorted(extras))
+
+
+def _coverage_with_approval(content, state, digest, approval):
+    if approval is not None:
+        if (type(approval) is not dict or type(approval.get("extra_ids")) is not list or
+                not approval["extra_ids"] or
+                any(type(x) is not str or not re.fullmatch(r"[0-9]+", x) for x in approval["extra_ids"]) or
+                approval["extra_ids"] != sorted(set(approval["extra_ids"])) or
+                approval != dict(_approval_payload(state, digest, approval["extra_ids"]), approved=True) or
+                approval.get("approved") is not True):
+            raise ExportError("范围授权格式或绑定无效", code="scope_approval_invalid")
+    try:
+        exact_suffix = validate_order_coverage(content, state["found_ids"])
+        if approval is not None:
+            raise ExportError("没有范围例外，不接受无关授权", code="scope_approval_invalid")
+        return exact_suffix
+    except ExportError as error:
+        if error.code != "order_coverage_mismatch":
+            raise
+        extras = error.details["actual_extra_ids"]
+        missing = error.details["missing_ids"]
+        payload = _approval_payload(state, digest, extras)
+        evidence = state.get("merge_evidence", {})
+        proven = set()
+        for internal, constituents in evidence.items():
+            if (internal in state["internal_ids"] and
+                    state.get("internal_order_ids", {}).get(internal) == constituents and
+                    set(constituents) & set(state["found_ids"])):
+                proven.update(constituents)
+        eligible = (state["version"] == 2 and bool(extras) and not missing and set(extras) <= proven)
+        required = dict(payload, approved=True)
+        if not eligible or type(approval) is not dict or approval != required or approval.get("approved") is not True:
+            details = dict(error.details, task_id=payload["task_id"], sha256=digest,
+                           output=state["output"], requested_ids=state["requested_ids"],
+                           scope_approval_eligible=eligible)
+            if eligible:
+                details["approval_required"] = payload
+            raise ExportError(str(error), code="scope_approval_required" if eligible and approval is None
+                              else "scope_approval_invalid" if eligible else "scope_not_eligible",
+                              recovery={"action": "explicit-scope-approval" if eligible else "inspect-local-file",
+                                        "requiredResume": True}, details=details) from None
+        suffix = validate_order_coverage(content, state["found_ids"] + extras)
+        state["scope_exception"] = required
+        return suffix
+
+
+def _accept_pending(session, headers, state, output, state_path, *, scope_approval, **options):
+    pending = _pending_path(state_path)
     task = state["candidate_ids"][0]
-    url = poll_export(session, headers, task, schema=schema, max_polls=max_polls,
-                      poll_interval=poll_interval, sleep=sleep, timeout=timeout)
-    content = download_export(session, headers, url, extra_domains=extra_domains,
-                              timeout=timeout, public_download=public_download)
-    suffix = validate_order_coverage(content, state["found_ids"])
+    if state.get("pending"):
+        binding = state["pending"]
+        content = _read_pending(pending)
+        digest = hashlib.sha256(content).hexdigest()
+        if binding != dict(sha256=digest, task_id=task, output=state["output"],
+                           requested_ids=state["requested_ids"]):
+            raise ExportError("待验收文件或绑定已改变", code="pending_binding_mismatch")
+        validate_archive(content)
+    else:
+        if pending.exists() or pending.is_symlink():
+            raise ExportError("发现未绑定待验收文件；禁止覆盖或重新下载", code="pending_unbound")
+        if state.get("download_attempted"):
+            raise ExportError("下载已尝试但未取得已绑定文件；禁止自动重复下载", code="download_outcome_unknown")
+        state["download_attempted"] = True
+        _save_state(state_path, state)
+        url = poll_export(session, headers, task, schema=options["schema"], max_polls=options["max_polls"],
+                          poll_interval=options["poll_interval"], sleep=options["sleep"], timeout=options["timeout"])
+        content = download_export(session, headers, url, extra_domains=options["extra_domains"],
+                                  timeout=options["timeout"], public_download=options["public_download"])
+        validate_archive(content)
+        _atomic_create(pending, content)
+        digest = hashlib.sha256(content).hexdigest()
+        state["pending"] = dict(sha256=digest, task_id=task, output=state["output"],
+                                requested_ids=state["requested_ids"])
+        _save_state(state_path, state)
+    suffix = _coverage_with_approval(content, state, digest,
+                                     scope_approval if scope_approval is not None else state.get("scope_exception"))
+    _save_state(state_path, state)
     if not output.suffix:
         output = output.with_suffix(suffix)
     elif output.suffix.lower() != suffix:
-        raise ExportError("输出扩展名与下载内容不一致；请使用 " + suffix)
+        raise ExportError("输出扩展名与下载内容不一致", code="output_type_mismatch")
     _atomic_create(output, content)
     state["phase"] = "complete"
     _save_state(state_path, state)
+    pending.unlink()
     return _export_report(state, output, suffix, len(content), state_path)
 
 
@@ -886,7 +1175,66 @@ def _export_report(state, output, suffix, byte_count, state_path):
             "task_count_matches_internal_orders": (None if state.get("task_total_count") is None else
                                                    state["task_total_count"] == len(state["internal_ids"])),
             "task_association_time_checked": "creation_window" in state,
-            "state_path": str(state_path), "file_type": suffix[1:], "bytes": byte_count}
+            "state_path": str(state_path), "file_type": suffix[1:], "bytes": byte_count,
+            "scope_exception": state.get("scope_exception"),
+            "sha256": (state.get("pending") or {}).get("sha256")}
+
+
+def export_error_diagnostic(error):
+    """Project only validated business fields, never arbitrary exception details."""
+    codes = {"export_schema_invalid", "missing_orders", "order_coverage_mismatch", "scope_approval_required",
+             "scope_approval_invalid", "scope_not_eligible", "pending_invalid", "pending_unbound",
+             "pending_binding_mismatch", "download_outcome_unknown", "published_hash_mismatch",
+             "state_invalid", "output_type_mismatch", "download_limit_exceeded", "download_failed",
+             "download_domain_rejected", "poll_limit_exceeded", "export_creation_not_confirmed",
+             "export_confirmation_required"}
+    code = error.code if isinstance(error, ExportError) and error.code in codes else "export_schema_invalid"
+    raw = error.details if isinstance(error, ExportError) and type(error.details) is dict else {}
+    details = {}
+    enums = {
+        "export_step": {"check_confirmation", "create"},
+        "parse_step": {"request", "decode", "unwrap", "return_value", "create_return"},
+        "reason": {"request_failed", "html_or_empty", "framing_length_mismatch", "unrecognized_encoding",
+                   "nesting_limit", "unsupported_type", "server_error", "explicit_failure",
+                   "success_not_confirmed", "confirmation_required", "creation_not_confirmed",
+                   "unexpected_return", "sms_confirmation_marker", "not_logged_in_marker",
+                   "exception_message_present"},
+        "type": {"null", "boolean", "string", "object", "array", "number", "unknown"},
+    }
+    for key, allowed in enums.items():
+        if type(raw.get(key)) is str and raw[key] in allowed:
+            details[key] = raw[key]
+    for key in ("actual_extra_ids", "missing_ids", "actual-extra", "missing", "requested_ids", "extra_ids"):
+        value = raw.get(key)
+        if type(value) is list and all(type(x) is str and re.fullmatch(r"[0-9]+", x) for x in value):
+            details[key] = value.copy()
+    for key, pattern in (("task_id", r"[0-9]+"), ("sha256", r"[a-f0-9]{64}")):
+        if type(raw.get(key)) is str and re.fullmatch(pattern, raw[key]):
+            details[key] = raw[key]
+    if type(raw.get("output")) is str and Path(raw["output"]).is_absolute() and "://" not in raw["output"]:
+        details["output"] = raw["output"]
+    if type(raw.get("scope_approval_eligible")) is bool:
+        details["scope_approval_eligible"] = raw["scope_approval_eligible"]
+    approval = raw.get("approval_required")
+    if type(approval) is dict and set(approval) == {"approved", "task_id", "sha256", "output", "requested_ids", "extra_ids"}:
+        nested = export_error_diagnostic(ExportError("", details={k: v for k, v in approval.items() if k != "approved"}))["details"]
+        if len(nested) == 5 and approval["approved"] is False:
+            details["approval_required"] = dict(nested, approved=False)
+    action = "explicit-scope-approval" if code == "scope_approval_required" else "inspect-and-resume"
+    return {"code": code, "recovery": {"action": action, "requiredResume": True}, "details": details}
+
+
+def can_resume_offline(state_path, order_ids, output):
+    """Read-only preflight; run_export still rechecks under its journal lock."""
+    state_path = Path(state_path).absolute()
+    if not state_path.exists() and not state_path.is_symlink():
+        return False
+    state = _load_state(state_path)
+    if state["requested_ids"] != normalize_order_ids(order_ids) or state["output"] != str(Path(output).absolute()):
+        raise ExportError("续跑参数与状态不一致", code="state_invalid")
+    # Also bypass login for a blocked uncertain download so it fails locally,
+    # rather than prompting a login which cannot solve the recovery problem.
+    return state["phase"] == "complete" or bool(state.get("pending") or state.get("download_attempted")) or _pending_path(state_path).exists()
 
 
 @contextmanager
@@ -930,7 +1278,7 @@ def _journal_lock(path):
 def run_export(session, headers, order_ids, output, *, schema=ResponseSchema(),
                max_pages=1000, max_polls=120, poll_interval=2, sleep=time.sleep,
                extra_domains=(), timeout=30, public_download=None, state_path=None,
-               resume=False, allow_missing=False, export_type=None):
+               resume=False, allow_missing=False, export_type=None, scope_approval=None):
     """Serialize a durable real-flow export; see _run_export for resume semantics."""
     state_path = Path(state_path or (str(Path(output).absolute()) + ".state.json")).absolute()
     with _journal_lock(state_path):
@@ -938,4 +1286,5 @@ def run_export(session, headers, order_ids, output, *, schema=ResponseSchema(),
                            max_pages=max_pages, max_polls=max_polls, poll_interval=poll_interval,
                            sleep=sleep, extra_domains=extra_domains, timeout=timeout,
                            public_download=public_download, state_path=state_path,
-                           resume=resume, allow_missing=allow_missing, export_type=export_type)
+                           resume=resume, allow_missing=allow_missing, export_type=export_type,
+                            scope_approval=scope_approval)

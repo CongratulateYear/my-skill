@@ -5,14 +5,15 @@ Prints ONE JSON object on stdout so callers can branch on it, and exits with:
 
   0  LOGGED_IN    the browser's tmall cookies are usable right now
                   (and, with --expect-company, the logged-in company matches)
-  3  NEED_LOGIN   cookies missing or expired, wrong account, or wrong company
-                  -> the agent must drive the login form through
-                  magpie-browser in the *already open* browser
+  3  NEED_LOGIN   session unavailable, expired, wrong account, or wrong company
+                  -> follow recovery in a NEW own Magpie tab in the already-open
+                  browser; fill the login form only when logged out
   1  ERROR        unexpected failure (keychain / DPAPI / decrypt / cookie db)
 
 Transport: --transport auto (default) reads the local cookie store first and
-falls back to the browser bridge (this skill's browser_bridge.py + an
-injected agent in the logged-in tgc.tmall.com tab) when the store cannot be
+falls back to the browser bridge bundled with this skill (browser_bridge.py +
+bridge_agent.js read and evaluated in the agent's NEW own Magpie tab on
+ tgc.tmall.com) when the store cannot be
 read at all (Windows v20 app-bound encryption, Edge-exclusive Cookies file,
 sandbox denying the temp area).
 
@@ -20,12 +21,15 @@ This script never opens a browser window, never launches a second browser, and
 never touches a password: driving the form is the agent's job (SKILL.md
 「登录流程」). It only reports state, plus the concrete next `action` for the
 agent, and can optionally wait for the login to land so the caller does not
-race the browser. Identity defaults to the expected COMPANY: several login
-phones may belong to one company, and accountInfo erpMobile is not proof of
-which phone logged in. --expect-account is diagnostic when --expect-company
-matches; add --strict-account to block a comparable account mismatch. Without
---expect-company, --expect-account keeps the legacy account-only check.
-Company mismatch/unknown always blocks before account checks.
+race the browser. Pass `--expect-account <手机号或账号提示>` so a
+still-logged-in previous account is reported as `wrong-account` instead of a
+false success: phone numbers are compared against the platform's masked
+erpMobile (accountInfo.dingdingMobile), non-phone hints against the cookie
+hint; when neither is comparable the result is `accountCheck: unverified`
+(non-blocking) instead of a false wrong-account. Pass `--expect-company <名称>`
+(user usually sends the short company/shop name, e.g. 埔鸣) so a logged-in
+session of a DIFFERENT company is reported as `wrong-company` instead of a
+false success.
 """
 from __future__ import annotations
 
@@ -45,39 +49,44 @@ EXIT_NEED_LOGIN = 3
 
 LOGIN_URL = "https://tgcwork.tmall.com/login"
 
+# Recovery instructions only: do not change session transport or validation logic.
+RECOVERY_ROUTE = (
+    "固定恢复路线：用 magpie-browser 在当前已打开的浏览器中 tab_new 新建自己的 Magpie 标签页，"
+    "不复用用户、其他 agent 或旧标签页，不新开浏览器或 profile。"
+    "同一次恢复继续用自己新建的同一标签页，不必每步再开。"
+    "打开 https://tgc.tmall.com/ds/page/supplier/home，用 snapshot 判断："
+    "已登录则直接桥接，只有确认未登录才打开 https://tgcwork.tmall.com/login 填表。"
+    "凭据只用于本次表单，不落盘、不回显；补账号后再次检查密码是否有值，保留自动填充。"
+    "缺凭据只询问一次，无新输入不重复催问；不得把含凭据历史恢复到临时文件。"
+    "验证码、滑块和短信验证由用户人工完成。"
+    "后台启动本 skill 的 scripts/browser_bridge.py --port 8899；"
+    "用 read 读取本 skill 的 scripts/bridge_agent.js 源码，在自己标签页的 tgc.tmall.com 页面"
+    "用 evaluate 直接执行整段源码；不要插入 script src。导航或换号后重新 read 并 evaluate。"
+    "随后重跑本命令（保留 --expect-company / --expect-account）；"
+    "有目标公司时必须传 --expect-company，以服务端公司验证通过且退出码 0 为成功标准，"
+    "页面跳转、agent started、桥已连接或 erpMobile 有值均不代表成功。"
+)
+
 ACTION = {
-    "loggedIn": "登录态有效，直接继续原流程，不要再打开登录页。",
-    "no-cookie": (
-        "浏览器里还没有天猫登录 cookie。用 magpie-browser 的 tabs 先找有没有 "
-        "tgcwork.tmall.com 标签，没有就 tab_new 在【当前这个已经打开的浏览器】里"
-        f"打开 {LOGIN_URL}（不要新开浏览器、不要用 chrome-devtools），登录后重跑本命令。"
-    ),
-    "no-session": (
-        "本机读不到登录态，浏览器桥也未接入。两条路任选其一："
-        "① 用 magpie-browser 找 tgcwork.tmall.com 标签（没有就 tab_new 在【当前已打开的"
-        f"浏览器】里打开 {LOGIN_URL}）完成登录后重跑本命令；"
-        "② 浏览器里其实已登录时，后台启动本 skill 自带的 scripts/browser_bridge.py"
-        "（默认端口 8899），再在已登录的 tgc.tmall.com 标签里用 evaluate 注入"
-        " <script src=http://127.0.0.1:8899/agent.js></script>，然后重跑本命令。"
-    ),
-    "expired": (
-        "天猫登录 cookie 还在但已过期。用 magpie-browser 复用现有的 "
-        f"tgcwork.tmall.com 标签（没有就 tab_new 一个，仍在当前浏览器里）打开 {LOGIN_URL} "
-        "重新登录，登录后重跑本命令。"
-    ),
+    "loggedIn": "登录态有效，直接继续原流程，不要再打开登录页。", 
+    "no-cookie": "本机未取得可用 cookie，不据此认定浏览器未登录。" + RECOVERY_ROUTE,
+    "no-session": "会话尚不可用；no-session 不等于未登录，先检查自己新建的页面。" + RECOVERY_ROUTE,
+    "expired": "服务端未确认登录态有效，先检查自己新建的页面，不盲目填表。" + RECOVERY_ROUTE,
     "wrong-account": (
-        "当前浏览器登录的是另一个天猫账号。用 magpie-browser 在该标签页退出登录，"
-        f"再用目标账号登录 {LOGIN_URL}（复用同一标签，不要新开浏览器、不要把密码落盘），"
-        "登录后重跑本命令。"
-    ),
+        "当前登录的是另一账号；按登录skill区分计划内切换与意外公司不符。"
+        "仅用户已给公司顺序、对应凭据并授权依次执行，且当前会话确认为刚完成的上一家公司时，"
+        "计划内切换无需再问；其他情况先经用户确认。只在自己的标签页真实退出并登录目标账号"
+        "（退出会影响同 profile 的会话）；不扩展为ERP换号授权。"
+    ) + RECOVERY_ROUTE,
     "wrong-company": (
-        "当前浏览器登录的账号不属于目标公司。用 magpie-browser 在 tgc.tmall.com 页面"
-        "退出登录（右上角公司名 → 退出），再用目标公司的账号登录 "
-        f"{LOGIN_URL}（复用同一标签，不要新开浏览器、不要把密码落盘），登录后重跑本命令。"
-    ),
+        "服务端返回的公司不属于目标公司；意外公司不符须先经用户确认，不能忽略验证。"
+        "仅用户已给公司顺序、对应凭据并授权依次执行，且当前会话确认为刚完成的上一家公司时，"
+        "计划内切换无需再问；其他情况先核对。只在自己的标签页真实退出并登录目标账号"
+        "（退出会影响同 profile 的会话）；不扩展为ERP换号授权。"
+    ) + RECOVERY_ROUTE,
     "company-unknown": (
-        "登录态有效，但查询公司名失败（接口异常）。重跑一次本命令；仍失败则人工在"
-        " tgc.tmall.com/ds/page/supplier/home 页面右上角核对公司名。"
+        "服务端公司查询失败，不能宣告公司验证成功。保留 --expect-company 重跑一次；"
+        "仍失败则停止原流程并请用户核对，页面公司名不能代替服务端验证。"
     ),
 }
 
@@ -147,7 +156,7 @@ def main(argv: list[str] | None = None) -> int:
             except Exception:  # noqa: BLE001 - non-fatal convenience
                 pass
 
-    parser = argparse.ArgumentParser(description="检查天猫登录态；未登录时给出 agent 的下一步动作")
+    parser = argparse.ArgumentParser(description="检查天猫登录态；不可用时给出固定恢复路线，未登录才填表")
     parser.add_argument("--browser", default="auto", choices=[*tmall_session.BROWSERS, "auto"])
     parser.add_argument("--domain", default=tmall_session.DEFAULT_DOMAIN)
     parser.add_argument("--transport", default="auto", choices=tmall_session.TRANSPORTS,
@@ -157,15 +166,12 @@ def main(argv: list[str] | None = None) -> int:
                         help="浏览器里刚点完登录时，最多等这么多秒让 cookie 落库")
     parser.add_argument("--interval", type=float, default=2.0, help="轮询间隔秒数")
     parser.add_argument("--expect-account", default="",
-                        help="账号提示；公司匹配时默认仅诊断，不作为登录身份约束")
-    parser.add_argument("--strict-account", action="store_true",
-                        help="显式严格账号核对：可比账号不匹配仍报 wrong-account；须同时给 --expect-account")
+                        help="期望登录的账号（手机号或账号提示）；手机号只与平台脱敏 erpMobile 比对，"
+                             "比对不上时报 unverified 而不是 wrong-account")
     parser.add_argument("--expect-company", default="",
                         help="期望的公司/店铺名（用户通常发简称，如「埔鸣」）；"
                              "登录的公司不匹配时判为 wrong-company")
     args = parser.parse_args(argv)
-    if args.strict_account and not args.expect_account.strip():
-        parser.error("--strict-account requires --expect-account")
 
     started = time.monotonic()
     expected = args.expect_account.strip()
@@ -173,6 +179,21 @@ def main(argv: list[str] | None = None) -> int:
     bridge_url = args.bridge_url or None
 
     def judge(state: dict) -> dict:
+        if expected and state["loggedIn"]:
+            verdict = tmall_session.account_verdict(
+                expected, str(state.get("erpMobile") or ""), str(state.get("accountHint") or ""))
+            if verdict == "mismatch":
+                state.update({
+                    "loggedIn": False,
+                    "reason": "wrong-account",
+                    "expectedAccount": expected,
+                    "action": ACTION["wrong-account"],
+                })
+            elif verdict == "unverified":
+                state["accountCheck"] = (
+                    f"unverified：无法核对账号（expected={expected}，erpMobile/提示均不可比），未阻断")
+            else:
+                state["accountCheck"] = "ok"
         if expected_company and state["loggedIn"]:
             actual_company = str(state.get("company") or "")
             if not actual_company:
@@ -190,25 +211,6 @@ def main(argv: list[str] | None = None) -> int:
                     "expectedCompany": expected_company,
                     "action": ACTION["wrong-company"],
                 })
-        if expected and state["loggedIn"]:
-            verdict = tmall_session.account_verdict(
-                expected, str(state.get("erpMobile") or ""), str(state.get("accountHint") or ""))
-            state["accountCheck"] = verdict
-            if verdict == "mismatch" and (args.strict_account or not expected_company):
-                state.update({
-                    "loggedIn": False,
-                    "reason": "wrong-account",
-                    "expectedAccount": expected,
-                    "action": ACTION["wrong-account"],
-                })
-            elif verdict == "mismatch":
-                state["accountCheck"] = "mismatch-ignored-company-match"
-                state["accountNote"] = "公司匹配；登录手机号与 erpMobile 可不同，不阻断。"
-            elif verdict == "unverified":
-                state["accountCheck"] = (
-                    f"unverified：无法核对账号（expected={expected}，erpMobile/提示均不可比），未阻断")
-            else:
-                state["accountCheck"] = "ok"
         return state
 
     try:
@@ -239,7 +241,7 @@ def main(argv: list[str] | None = None) -> int:
         via = f" [via {state.get('transport', '')}]" if state.get("transport") else ""
         print(f"登录态有效：{state['accountHint']}{suffix}{via}", file=sys.stderr)
         return EXIT_OK
-    print(f"需要登录（{state['reason']}）：{state['detail'] or state['accountHint']}", file=sys.stderr)
+    print(f"需要恢复或核对（{state['reason']}）：{state['detail'] or state['accountHint']}", file=sys.stderr)
     return EXIT_NEED_LOGIN
 
 

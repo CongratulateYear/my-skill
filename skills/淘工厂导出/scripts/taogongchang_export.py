@@ -16,6 +16,12 @@ cookie 只在下载脚本内存中使用）；不落盘任何凭据。
 from __future__ import annotations
 
 import argparse
+import builtins
+import functools
+import stat
+
+# GUI/pipe execution is not a terminal: progress must not wait for buffer fill.
+print = functools.partial(builtins.print, flush=True)
 import json
 import os
 import re
@@ -108,6 +114,12 @@ def build_folder(output_root: Path, company: str, args: argparse.Namespace) -> P
     return Path(root).expanduser().resolve() / folder_name(company, start, end)
 
 
+def runtime_directory(folder: Path) -> Path:
+    """Stable internal state root shared with company orchestration (no writes)."""
+    from tgc_runtime import runtime_for
+    return runtime_for(folder)
+
+
 # 根目录裸文件名前缀 → 流程名（单流程裸跑/历史文件识别）
 _ROOT_SPECIALS = (("商品货款", "商品贷款"), ("GEI@", "所有商品效果数据导出"))
 ROOT_PREFIX_RULES = tuple(sorted(
@@ -196,8 +208,9 @@ def finalize_folder(folder: Path, module_key: str | None = None, *,
             groups[MODULE_DISPLAY_NAMES[key]] = sources
     affected = selected if output_folder is not None else set(groups)
     published: list[Path] = []
-    # Transaction is inside the company folder (same filesystem on Windows/macOS).
-    with tempfile.TemporaryDirectory(prefix=".finalize-", dir=target_root) as temp:
+    # Stage beside the company folder, not inside the delivery directory.
+    # Keeping its parent filesystem preserves atomic os.replace across drives.
+    with tempfile.TemporaryDirectory(prefix=".finalize-", dir=target_root.parent) as temp:
         staging = Path(temp)
         plans: list[tuple[Path, Path]] = []
         for display, sources in groups.items():
@@ -237,6 +250,58 @@ def finalize_folder(folder: Path, module_key: str | None = None, *,
                   and any(_is_final(p, display) for display in selected))
 
 
+def filesystem_path(path: Path) -> str:
+    """Windows rename can push existing children past MAX_PATH (260)."""
+    raw = os.path.abspath(path)
+    if os.name != "nt" or raw.startswith("\\\\?\\"):
+        return raw
+    return "\\\\?\\UNC\\" + raw[2:] if raw.startswith("\\\\") else "\\\\?\\" + raw
+
+
+def cleanup_published(retired: Path, state_root: Path) -> None:
+    """Delete only this retired run, never links, unknown data or recovery evidence.
+
+    Preflight the ENTIRE tree before deleting anything. Extended-length paths are
+    needed for both preflight and rmtree, not merely for the final unlink.
+    No chmod/ACL changes and no retry that masks locks or access denials.
+    """
+    retired, state_root = Path(retired).absolute(), Path(state_root).absolute()
+    pattern = r"\.published-(?:all|" + "|".join(map(re.escape, MODULE_DISPLAY_NAMES)) + r")-[0-9a-f]{32}"
+    if retired.parent != state_root or not re.fullmatch(pattern, retired.name):
+        raise ValueError("拒绝清理非本次 published 目录")
+    for ancestor in (retired, *retired.parents):
+        info = os.lstat(filesystem_path(ancestor))
+        if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+            raise ValueError(f"拒绝清理链接/reparse point：{ancestor}")
+    root = filesystem_path(retired)
+    def walk_error(exc):
+        raise exc
+    for parent, dirs, files in os.walk(root, followlinks=False, onerror=walk_error):
+        for name in dirs + files:
+            path = os.path.join(parent, name)
+            info = os.lstat(path)
+            if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+                raise ValueError(f"拒绝清理链接/reparse point：{path}")
+            if not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
+                raise ValueError(f"拒绝清理非常规文件：{path}")
+            # Recovery material/unknown files do not belong to disposable data.
+            lowered = name.lower()
+            if any(word in lowered for word in ("journal", "receipt", "backup", "备份")) or lowered.startswith((".previous-", ".work-", ".published-")):
+                raise ValueError(f"拒绝清理恢复凭证或备份：{path}")
+            if name in files and not (lowered.endswith((".xlsx", ".zip", ".asset-inventory-state.json"))):
+                raise ValueError(f"拒绝清理未知文件：{path}")
+    shutil.rmtree(root)
+
+
+def cleanup_warning(retired: Path, exc: Exception) -> str:
+    # Local filesystem diagnostics only: never dump downloader state/headers.
+    return (f"警告：发布已完成，清理中断；保留目录 {retired}，不要用于 --resume；"
+            f"{type(exc).__name__}: {exc}; errno={getattr(exc, 'errno', None)}, "
+            f"winerror={getattr(exc, 'winerror', None)}, "
+            f"filename={getattr(exc, 'filename', None)!r}, "
+            f"filename2={getattr(exc, 'filename2', None)!r}")
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="淘工厂导出：17 个账单流程纯导出到单一文件夹")
     p.add_argument("--module", default="all",
@@ -252,6 +317,7 @@ def main() -> int:
     p.add_argument("--output-root", type=Path, default=Path.home() / "Downloads" / "淘工厂导出",
                    help="输出根目录，默认 ~/Downloads/淘工厂导出")
     p.add_argument("--batch-folder", type=Path, help="批次总目录；公司日期文件夹放在其内部，优先于 output-root")
+    p.add_argument("--state-dir", type=Path, help="运行状态与临时工作目录（必须在公司导出目录之外）")
     p.add_argument("--browser", choices=["auto", "chrome", "chrome-beta", "chrome-canary", "edge", "brave", "chromium"])
     p.add_argument("--transport", choices=["auto", "cookie", "bridge"])
     p.add_argument("--bridge-url", help="原样透传给内置下载器")
@@ -283,14 +349,33 @@ def main() -> int:
     args.skip_module = [MODULE_ALIASES.get(key, key) for key in args.skip_module]
     if any(key not in MODULE_DISPLAY_NAMES for key in args.skip_module):
         p.error("未知 --skip-module")
-    work = folder / f".work-{module}"
+    state_root = args.state_dir.expanduser().resolve() if args.state_dir else runtime_directory(folder)
+    if state_root == folder or folder in state_root.parents:
+        p.error("运行目录必须在公司导出目录之外")
+    if args.result_file:
+        args.result_file = args.result_file.expanduser().resolve()
+        if args.result_file == folder or folder in args.result_file.parents:
+            p.error("发布凭证必须放在公司导出目录之外")
+    work = state_root / f".work-{module}"
+    if args.result_file and (args.result_file == work or work in args.result_file.parents):
+        p.error("发布凭证必须放在临时工作目录之外")
     if not args.dry_run:
+        # Do not silently abandon old task state: it may represent a remote
+        # task whose creation outcome is unknown. Migration requires review.
+        legacy = ([path for path in folder.iterdir() if
+                   path.name.startswith(('.work-', '.previous-', '.published-', '.finalize-'))
+                   or path.name in ('.company-run.json', '.company-run.lock',
+                                    '.export-result.json', '.erp-result.json')]
+                  if folder.exists() else [])
+        if legacy:
+            p.error("发现旧版目录内运行状态；请核实并迁移/清理后再执行，不自动重建任务")
         folder.mkdir(parents=True, exist_ok=True)
+        state_root.mkdir(parents=True, exist_ok=True)
         if args.resume and not work.is_dir():
             p.error("没有对应的未完成工作目录；成功导出后无需 --resume")
         if not args.resume and work.exists():
             # Never destroy an interrupted run just because a new export starts.
-            work.rename(folder / f".previous-{module}-{uuid.uuid4().hex}")
+            work.rename(state_root / f".previous-{module}-{uuid.uuid4().hex}")
         work.mkdir(exist_ok=True)
         if args.resume:
             states = list(work.glob("*.asset-inventory-state.json"))
@@ -303,13 +388,13 @@ def main() -> int:
                               module == "all" and not any(
                                   child.name.startswith(f"asset-inventory-{key}-") for key in completed))]
                 if stale:
-                    backup = folder / f".previous-{module}-{uuid.uuid4().hex}"
+                    backup = state_root / f".previous-{module}-{uuid.uuid4().hex}"
                     backup.mkdir()
                     for child in stale:
                         child.rename(backup / child.name)
 
     cmd = [
-        sys.executable, str(DOWNLOAD_SCRIPT),
+        sys.executable, "-u", str(DOWNLOAD_SCRIPT),
         "--module", module,
         "--no-pan-suan",
         "--output-dir", str(work),
@@ -361,7 +446,9 @@ def main() -> int:
                 "dates": {key: getattr(args, key) for key in
                           ("order_pay_start", "order_pay_end", "write_off_start", "write_off_end")},
                 "module": module, "skipped": sorted(skipped),
-                "results": {key: {"status": state["results"][key]["status"]} for key in selected},
+                "results": {key: {field: state["results"][key][field] for field in
+                                  ("status", "queryRows", "dates") if field in state["results"][key]}
+                            for key in selected},
                 "files": {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in kept},
             }
             args.result_file.parent.mkdir(parents=True, exist_ok=True)
@@ -372,22 +459,22 @@ def main() -> int:
                 os.fsync(stream.fileno())
             os.replace(temporary, args.result_file)
         # Only this invocation's isolated working directory is disposable.
-        if work.parent != folder or not work.name.startswith(".work-"):
+        if work.parent != state_root or not work.name.startswith(".work-"):
             raise RuntimeError("拒绝清理非工作目录")
         # Rename is atomic on this filesystem. Before it: all sources remain
         # resumable. After it: partial cleanup is NEVER offered as a resume run.
-        retired = folder / f".published-{module}-{uuid.uuid4().hex}"
+        retired = state_root / f".published-{module}-{uuid.uuid4().hex}"
         work.rename(retired)
         try:
-            shutil.rmtree(retired)
-        except OSError:
-            print(f"警告：发布已完成，清理中断；保留目录 {retired.name}，不要用于 --resume", file=sys.stderr)
+            cleanup_published(retired, state_root)
+        except (OSError, ValueError) as exc:
+            print(cleanup_warning(retired, exc), file=sys.stderr)
         print(f"\n导出完成，最终 xlsx 共 {len(kept)} 个，全部在：{folder}")
         for path in kept:
             print(f"  - {path.name}")
     else:
-        print(f"\n导出脚本退出码 {proc.returncode}；已成功流程的文件保留在 {folder}，"
-              f"可用 --resume 续跑（整理只在全部成功后进行）。", file=sys.stderr)
+        print(f"\n导出脚本退出码 {proc.returncode}；下载及状态保留在内部运行目录 {work}，"
+              f"最终交付目录 {folder} 保持不变；可用原参数 --resume 续跑。", file=sys.stderr)
     return proc.returncode
 
 

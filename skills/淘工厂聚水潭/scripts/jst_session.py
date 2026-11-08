@@ -15,7 +15,9 @@ WORKBENCH_URL = ORIGIN + '/epaas'
 ORDER_URL = ORIGIN + '/app/order/export/exportorder.aspx?_c=jst-epaas&epaas=true'
 
 class SessionError(RuntimeError):
-    pass
+    def __init__(self, message, code='session_unverified'):
+        super().__init__(message)
+        self.code = code
 
 class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -73,7 +75,7 @@ def validate_session(session, headers, expect_company=None):
     # A real ERP order page must contain the expected callback table and state;
     # isLogin cookies alone never count as server validation.
     if 'JTable1' not in text or '__VIEWSTATE' not in text or urlsplit(response.url).path.lower().endswith('login.aspx'):
-        raise SessionError('登录过期或无订单导出权限，请在浏览器登录后重试')
+        raise SessionError('登录过期或无订单导出权限，请在浏览器登录后重试', 'login_or_permission_required')
     # Validate a read-only business callback, not merely static HTML markers.
     from jst_export import get_hidden, _callback, ExportError
     try:
@@ -93,7 +95,7 @@ def validate_session(session, headers, expect_company=None):
         names.extend(html.unescape(x) for x in re.findall(pattern, text))
     company = next((x for x in names if company_matches(expect_company, x)), '') if expect_company else (names[0] if names else '')
     if expect_company and not company:
-        raise SessionError('无法从服务端页面确认目标公司，停止：请核对账号；不要仅凭cookie公司名放行')
+        raise SessionError('无法从服务端页面确认目标公司，停止：请核对账号；不要仅凭cookie公司名放行', 'company_unverified')
     return {'loggedIn': True, 'company': company, 'companyCheck': 'matched' if expect_company else 'not-requested'}
 
 
@@ -139,6 +141,11 @@ def build_session(transport='auto', browser='auto', bridge_url=None, expect_comp
     import browser_bridge
     try:
         client = browser_bridge.BridgeClient(bridge_url, ensure=False)
+        state = browser_bridge.ping(client.port)
+        if not state.get('ok'):
+            raise SessionError('聚水潭浏览器桥未启动；先由agent后台启动8901桥', 'bridge_not_running')
+        if not state.get('agentAttached'):
+            raise SessionError('桥已启动但ERP标签未注入代理；需agent实际注入', 'bridge_agent_missing')
         client.wait_ready(0)
         page = client.session_info().get('page', '')
         if urlsplit(page).hostname != 'www.erp321.com': raise SessionError('浏览器桥未连接聚水潭页面')
@@ -150,14 +157,56 @@ def build_session(transport='auto', browser='auto', bridge_url=None, expect_comp
         raise SessionError('聚水潭浏览器桥不可用；后台启动 browser_bridge.py --port 8901，在已登录ERP的新Magpie标签页注入bridge_agent.js') from None
 
 
-def main():
+def recovery_action(reason='session_unverified', expect_company=None, bridge_url=None):
+    """Agent-facing plan only: Python cannot inspect or drive Magpie form UI."""
+    from pathlib import Path
+    from urllib.parse import urlsplit
+    port = urlsplit(bridge_url).port if bridge_url else 8901
+    port = port or 8901
+    return {
+        'reason': reason,
+        'bridgeState': ('not_running' if reason == 'bridge_not_running' else
+                        'agent_missing' if reason == 'bridge_agent_missing' else 'unverified'),
+        'bridgeStartArgv': ['python', str(Path(__file__).with_name('browser_bridge.py')), '--port', str(port)],
+        'bridgeAgentSource': str(Path(__file__).with_name('bridge_agent.js')),
+        'expectCompany': expect_company,
+        'resumePolicy': {'sameInputs': True, 'sameOutputDirectory': True,
+                         'preserveTaskState': True, 'addResumeAfterExportAttempt': True,
+                         'neverRecreateUncertainTask': True},
+        'type': 'inspect-own-magpie-tab',
+        'executor': 'agent-with-magpie-browser',
+        'browser': 'current-existing-browser',
+        'tab': 'new-own-magpie-tab',
+        'workbenchUrl': WORKBENCH_URL,
+        'loginUrl': LOGIN_URL,
+        'loginState': 'login-or-permission-required' if reason == 'login_or_permission_required' else 'unverified',
+        'steps': [
+            'Agent starts bridgeStartArgv as a tracked background job if bridge is not running; Python never injects Magpie.',
+            'Open workbench in a new own Magpie tab; do not touch user/other-agent tabs.',
+            'If already signed in, attach bridge and verify server session; do not log out.',
+            'If login is needed, inspect the real form refs and only credential presence, never password values.',
+            'Preserve prefilled credentials; if both fields are populated, click the real login submit without asking for credentials.',
+            'Only fill missing fields using ERP credentials explicitly supplied for this attempt; never use Taogongchang credentials.',
+            'Ask once for missing ERP credentials only after inspecting the form; do not extract or persist autofill/passwords.',
+            'Stop for human handling of SMS, captcha, slider or risk checks; do not bypass.',
+            'After submitting, attach bridge in the same own ERP tab and rerun server validation with original company constraint.'
+        ],
+        'prefilledCredentials': 'preserve-and-submit',
+        'credentialPrompt': 'only-after-form-inspection-if-missing',
+        'humanRequired': ['sms', 'captcha', 'slider', 'risk-check'],
+        'successCriterion': 'server-order-query-and-requested-company-validated',
+        'pythonControlsBrowser': False,
+    }
+
+
+def main(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument('--transport', choices=['auto','cookie','bridge'], default='auto')
     p.add_argument('--browser', default='auto', choices=['auto',*cookies.BROWSERS])
     p.add_argument('--bridge-url')
     p.add_argument('--expect-company')
     p.add_argument('--wait', type=float, default=0)
-    a = p.parse_args()
+    a = p.parse_args(argv)
     deadline = time.monotonic() + max(0, a.wait)
     while True:
         try:
@@ -165,6 +214,13 @@ def main():
             print(json.dumps({'ok':True, **built['identity'], 'transport':built['transport']},ensure_ascii=False));return 0
         except SessionError as exc:
             if time.monotonic() < deadline: time.sleep(1);continue
-            print(json.dumps({'ok':False,'loggedIn':False,'reason':'login-required','action':str(exc),'loginUrl':LOGIN_URL},ensure_ascii=False));return 3
+            # Preserve legacy fields; failure is unverified, not proof of logout.
+            print(json.dumps({'ok':False,'loggedIn':False,'reason':'login-required',
+                              'action': '先检查自己的新Magpie标签页；已有预填聚水潭凭据则保留并提交，不立即要求人工。',
+                              'diagnostic':str(exc),'loginUrl':LOGIN_URL,
+                              'nextAction':recovery_action(exc.code, a.expect_company, a.bridge_url),
+                               'recovery_action':recovery_action(exc.code, a.expect_company, a.bridge_url),
+                               'session_status':exc.code,
+                              'expectCompany':a.expect_company},ensure_ascii=False));return 3
 if __name__ == '__main__':
     raise SystemExit(main())
