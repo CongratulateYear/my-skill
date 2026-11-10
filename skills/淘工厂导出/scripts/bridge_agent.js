@@ -2,6 +2,7 @@
  * 导航或切换账号后重新注入。凭据仅保留在内存，不打印。
  */
 (function () {
+  return "page-bridge-disabled: use official Playwright Extension";
   if (location.origin !== "https://tgc.tmall.com") {
     return "请先打开 https://tgc.tmall.com/ds/page/supplier/home 再注入";
   }

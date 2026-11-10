@@ -39,10 +39,10 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(self.summary({'skipped': 'no_order_id'})['conclusion'], '流程完成，存在待核查')
         self.assertEqual(self.summary(stage='merged')['conclusion'], '流程未完成，需要处理后续跑')
 
-    def test_bridge_recovery_does_not_assume_login_or_request_password(self):
-        for code in ('bridge_agent_missing', 'bridge_not_running'):
+    def test_playwright_recovery_does_not_assume_login_or_request_password(self):
+        for code in ('extension_not_connected', 'playwright_unavailable'):
             result = c.erp_recovery_status({'session_status': code, 'raw_response': 'SECRET'})
-            self.assertEqual(result['recovery_kind'], 'bridge_connection')
+            self.assertEqual(result['recovery_kind'], 'playwright_connection')
             self.assertEqual(result['user_input_required'], 'not_established')
             self.assertEqual(result['next_action'], 'recover_own_erp_tab_then_resume')
             self.assertNotIn('SECRET', json.dumps(result))

@@ -1,6 +1,6 @@
 ---
 name: taogongchang-export
-description: 从淘工厂导出17类账单/数据文件（消费者体验提升服务、商品贷款、交易补贴、交易佣金、先用后付、新疆物流集运、评价有礼、营销费用、商业化账户充值提现、投流推广佣金、淘客推广佣金、直播推广佣金、客服服务费、赔付追缴、处罚数据、出海增值服务费、所有商品效果数据导出）。公司名称、支付日期、结算日期全部由用户在消息里发送（不从登录态解析）；登录态默认通过「淘工厂登录」skill 自动获取（本机 cookie 库读不到时自动回退浏览器桥，含 HttpOnly cookie），也支持用户直接贴 queryBillDetail fetch（cookie 只在内存/临时文件中使用，绝不落盘、不回显）。默认一次执行全部17个流程，用户指定单一流程时（如「淘工厂导出罚款」）只执行该流程。所有导出文件统一放入一个文件夹，文件夹名为「公司名称_结算开始_结算结束」。当用户说「淘工厂导出」「导出淘工厂账单」「淘工厂导出罚款/处罚数据/商品贷款」等导出淘工厂文件的需求时使用；只导出文件、不写盘算工作簿（盘算请用「淘工厂合并」或「淘工厂资产盘算」）。
+description: 从淘工厂导出17类账单/数据文件（消费者体验提升服务、商品贷款、交易补贴、交易佣金、先用后付、新疆物流集运、评价有礼、营销费用、商业化账户充值提现、投流推广佣金、淘客推广佣金、直播推广佣金、客服服务费、赔付追缴、处罚数据、出海增值服务费、所有商品效果数据导出）。公司名称、支付日期、结算日期全部由用户在消息里发送（不从登录态解析）；登录态默认通过「淘工厂登录」skill 自动获取（官方Playwright Extension获取含HttpOnly的Cookie，执行期内存复用），也支持用户直接贴 queryBillDetail fetch（cookie 只在内存/临时文件中使用，绝不落盘、不回显）。默认一次执行全部17个流程，用户指定单一流程时（如「淘工厂导出罚款」）只执行该流程。所有导出文件统一放入一个文件夹，文件夹名为「公司名称_结算开始_结算结束」。当用户说「淘工厂导出」「导出淘工厂账单」「淘工厂导出罚款/处罚数据/商品贷款」等导出淘工厂文件的需求时使用；只导出文件、不写盘算工作簿（盘算请用「淘工厂合并」或「淘工厂资产盘算」）。
 ---
 
 # 淘工厂导出
@@ -18,11 +18,11 @@ description: 从淘工厂导出17类账单/数据文件（消费者体验提升�
 
 ## 登录态：一律通过「淘工厂登录」skill
 
-- 判据只用脚本：`python "<skills根>/淘工厂登录/scripts/ensure_login.py" --expect-company "<用户公司名称>"`（退出码 0=有效 / 3=需登录 / 1=脚本错）。
-- 需要登录时按「淘工厂登录」skill 的流程做：**当前已打开的浏览器**（绝不新开浏览器/新 profile）里**新开一个 Magpie 标签页**走 https://tgcwork.tmall.com/login 登录，不复用任何已有标签页；凭据用用户本轮消息里给的账号密码；滑块/短信让用户自己过；登录后 `ensure_login.py --wait 30 --expect-company "<用户公司名称>"` 确认再重跑导出。
+- 登录恢复、浏览器归属、凭据处理和服务端闸门以「淘工厂登录」skill为唯一规则来源。退出码0=已验证有效；3=需要恢复/核对，不等于未登录；1=脚本错误。总盘算场景由总流程接收结构化恢复交接，恢复后保持原批次续跑，不能盲目重导。
+- `playwright_session.py`为指向同级淘工厂登录skill的兼容入口，不维护第二份适配器实现。多公司调度只由总盘算入口管理，本导出脚本仍只处理一家。
 
-- **身份以公司为准**：门面固定将 `--company-name` 原文传入下载器 `--expect-company`；下载器在实际账单使用的同一 headers/session 上执行 `fetch_company` + `company_matches`（cookie、bridge、用户 fetch 均如此），未知/失败 `company-unknown`、不匹配 `wrong-company` 一律停止，不查询或创建账单任务。此前独立登录闸门通过不能替代此执行期校验。多个手机号可登录同一公司；公司匹配时不因 `erpMobile` 与用户登录手机号不同而阻断。不自动传 `--expect-account`；只有用户明确要求严格账号核对才在登录闸门加 `--expect-account <指定账号> --strict-account`。不能用手机号代替公司验证。
-- 独立调用内置下载器时优先 `--expect-company`、否则以 `--shop-name` 作为目标；两者均未提供的旧调用保留兼容，但**不提供目标公司保证**，不应用于本 skill 的公司导出。`--dry-run` 在任何 session/cookie/bridge/公司请求之前返回，无网络，不验证在线身份。门面日期必须由用户消息转成 CLI 参数（即便提供 fetch，也不再由 fetch 补缺日期），且在创建/隔离目录前本地校验。
+- **身份以公司为准**：门面固定将 `--company-name` 原文传入下载器 `--expect-company`；下载器在实际账单使用的同一 headers/session 上执行 `fetch_company` + `company_matches`（cookie、playwright、用户 fetch 均如此），未知/失败 `company-unknown`、不匹配 `wrong-company` 一律停止，不查询或创建账单任务。此前独立登录闸门通过不能替代此执行期校验。多个手机号可登录同一公司；公司匹配时不因 `erpMobile` 与用户登录手机号不同而阻断。不自动传 `--expect-account`；只有用户明确要求严格账号核对才在登录闸门加 `--expect-account <指定账号> --strict-account`。不能用手机号代替公司验证。
+- 独立调用内置下载器时优先 `--expect-company`、否则以 `--shop-name` 作为目标；两者均未提供的旧调用保留兼容，但**不提供目标公司保证**，不应用于本 skill 的公司导出。`--dry-run` 在任何 session/cookie/playwright/公司请求之前返回，无网络，不验证在线身份。门面日期必须由用户消息转成 CLI 参数（即便提供 fetch，也不再由 fetch 补缺日期），且在创建/隔离目录前本地校验。
 
 ## 流程名映射（用户中文说法 → --module）
 
@@ -56,7 +56,7 @@ description: 从淘工厂导出17类账单/数据文件（消费者体验提升�
 - `--batch-folder Path`：可选批次**总目录**，优先于 `--output-root`；内部仍创建 `<公司名称>_<开始>_<结束>` 公司目录，不把批次路径当作公司目录。
 - 多公司由上层严格按用户顺序逐家调用，每次复用同一个 `--batch-folder`；本脚本每次只处理一个公司。总编排可继续调用 `build_folder(output_root, company, args)`；公开 `folder_name(company, start, end)` 返回公司日期目录名。
 - `--browser` 原样透传：`auto/chrome/chrome-beta/chrome-canary/edge/brave/chromium`。
-- `--transport` 原样透传：`auto/cookie/bridge`；`--bridge-url` 原样透传浏览器桥地址。三者省略时由底层使用默认值（`auto`、`auto`、自动桥地址）。这些枚举已核对内置下载器参数，非自行猜测。
+- `--transport` 原样透传：`auto/playwright/cookie/bridge`；auto默认官方扩展，bridge仅兼容别名；非空`--bridge-url`拒绝，不再起桥。扩展仅支持macOS Chrome/Windows Edge；cookie为显式兼容选项。
 - `--resume` 保留：只续跑同公司日期输出路径对应的内部运行目录、同 `--module` 的未完成运行；使用相同日期和模块参数。成功运行已发布最终文件，不再需要 `--resume`。
 - `--state-dir Path` 可显式指定内部运行目录，必须在公司导出目录之外；续跑保持原路径。默认由输出目录的规范绝对路径计算稳定摘要，存入 Windows `%LOCALAPPDATA%/DeepSeekHarness/taogongchang-runtime/<摘要>`，其他平台 `~/.local/state/DeepSeekHarness/taogongchang-runtime/<摘要>`；不含认证信息。
 
@@ -87,7 +87,7 @@ python "<本技能目录>/scripts/taogongchang_export.py" \
 ... --resume
 ```
 
-脚本内部调用**本 skill 自带**的 `scripts/tmall_bill_download.py --no-pan-suan` 完成实际下载（源自 asset-inventory，已内置，无需再装）；17 个流程的固定顺序、billType、日期规则、轮询与安全解压全部沿用原定义。下载器的 `--transport auto` 与「淘工厂登录」一致：cookie 库读不到时自动回退浏览器桥。
+脚本内部调用**本 skill 自带**的 `scripts/tmall_bill_download.py --no-pan-suan` 完成实际下载（源自 asset-inventory，已内置，无需再装）；17 个流程的固定顺序、billType、日期规则、轮询与安全解压全部沿用原定义。下载器的 `--transport auto` 与「淘工厂登录」一致：默认官方扩展，同一执行期复用Cookie。
 
 ## 输出
 
@@ -103,7 +103,7 @@ python "<本技能目录>/scripts/taogongchang_export.py" \
 
 - FBI账单及 hosting「所有商品效果数据导出」在发起创建请求**之前**将 `remoteTasks[模块].phase=creating` 写入原状态文件（临时文件写入、flush/fsync 后原子替换）；收到唯一合法 `taskId` 后，立即写为 `phase=created`，再开始轮询。仅保存日期、查询条数、任务编号，不保存认证信息或下载 URL。
 - 原参数 `--resume` 校验公司原文、模块范围及日期；已记录 `created` 的未完成模块直接恢复该 taskId 的 poll/download，不再查询账单或创建任务。超时、远端 FAILED、下载/解压失败均保留编号；不会因失败自动重建。hosting 仅接受列表中该编号的记录，绝不取“最新第一条”代替；若任务不在当前前10条返回中则保守超时，不扩大查询或猜测。
-- `creating` 表示可能尚未发送、已发送无响应、响应缺编号/非法编号，或编号检查点落盘失败，均**阻断自动恢复与重建**。需要人工在远端核实任务、保留现场；当前不提供绕过开关。不要删状态/改 phase/去掉 `--resume` 来规避阻断，新的非续跑本来就代表新的导出请求，不享有旧任务去重保证。
+- `creating` 禁止重建。旧状态、网络创建结果未知、响应冲突均阻断自动关联，走下文显式核实恢复；不要删状态/改 phase/去掉 `--resume`。唯一例外：新Hosting状态已保存完整创建前快照和允许回执兜底标记时，按下文新增任务证据链只读关联，不重复创建。
 - 旧状态的已完成模块与 `results.status/publishFiles`、手工 skip 及编排发布凭证保持兼容，不升级/猜测历史结果。旧未完成远端任务若缺少可靠跟踪条目，保守停止，不能承诺去重；仅查询明细不创建远端任务的处罚数据不受此限制。
 - taskId 统一要求为**字符串**，1–128位，首位字母或数字，其余仅字母、数字、下划线、连字符；响应、续跑、轮询匹配及下载路径共用校验，拒绝整数、空白、路径片段、冲突编号及从响应文本猜编号。服务端若变更格式需人工核对再调整，不能静默放宽。
 - 边界：这是单进程同状态文件的保守恢复协议，不是服务器幂等键、并发锁或断电事务。创建前意图写入到编号检查点之间的进程中断可能留下已创建但未知的远端任务，不能自动消除该不确定窗口；状态文件丢失/被改写、并发运行和显式新任务也不保证全局 exactly-once。不要并发写同一公司/运行目录。
@@ -120,7 +120,7 @@ python "<本技能目录>/scripts/taogongchang_export.py" \
 ## 依赖
 
 - Python 3.11+，`cryptography`、`openpyxl`（缺依赖时用 uv 建 venv：`uv venv /tmp/tgexport-venv --python 3.12 && uv pip install --python /tmp/tgexport-venv/bin/python cryptography openpyxl`）。
-- 依赖同级 skill：「淘工厂登录」（登录态闸门与公司名校验）。下载器 `tmall_bill_download.py`（及其依赖 `tmall_session.py`、`_bootstrap.py`、`browser_bridge.py`、`bridge_agent.js`）已随本 skill 内置在 `scripts/`，不依赖 asset-inventory。
+- 依赖同级 skill：「淘工厂登录」（登录态闸门、公司名校验及规范Playwright适配器）。下载器 `tmall_bill_download.py`、`tmall_session.py`、`_bootstrap.py` 位于本skill的 `scripts/`；`playwright_session.py`仅兼容转发至同级登录skill，缺依赖须停止而非退回陈旧复制。不依赖asset-inventory。
 - 共享 vendor 目录 `<skills根>/.vendor`（装淘工厂登录 skill 时已就位）。
 
 身份字段说明：`erpMobile` 仅为 ERP 绑定信息，不代表当前实际登录手机号；公司名称才是默认身份判据。
@@ -136,3 +136,17 @@ python "<本技能目录>/scripts/taogongchang_export.py" \
 ## 编排发布凭证
 
 总编排使用 `--run-id` 与 `--result-file` 在工作目录退休前写出本次公司/日期/模块状态/发布文件SHA256摘要；`--result-file` 必须放在公司导出目录之外，默认由编排存入内部运行目录。不含Cookie、headers或下载签名URL。缺失/过期凭证不允许因旧表存在触发ERP。独立导出原用法不变。公司级续跑仅适用新版编排创建的新批次，历史业务目录不自动迁移。
+
+## Hosting任务编号兼容与不确定创建恢复
+
+- Hosting列表可使用直接记录上的数值`id`，仅此接口规范化为正安全整数字符串；FBI原taskId校验不变。精确匹配任务编号，禁止默认使用最新记录。
+- 创建前原子持久化UTC `attemptStartedAt` 与模块/日期/查询行数的 `requestIdentitySha256`（不含凭据），创建结果不确定时禁止重建。新状态以尝试时间为核验基准，而非易变的文件mtime。
+- `scripts/recover_hosting_task.py`默认只读；显式`--bind`才关联已有任务，不创建、不下载。必须提供`--state-file --expect-company --task-id --expected-state-sha256`，并持有与总编排同一`.company-run.lock`（Windows单字节锁/macOS flock）。工具从已知`.work-<scope>`布局确定锁；不能指定无关锁绕过并发保护。
+- 要求公司闸门通过、状态creating且无编号、请求摘要一致、支付日期对应任务名、远端创建时间在尝试时间前后120秒、前10条中唯一匹配且FINISHED；歧义即停。旧状态缺尝试时间默认拒绝，仅用户明确接受后加`--allow-legacy-mtime`使用较弱的mtime证据。
+- 通用Hosting回执兜底：创建前完整有界分页快照并保存已有编号；单次创建响应只有ACK/空编号或不可用编号时，保存不含原值的响应结构诊断。只有同公司、同请求摘要、创建后新增编号、精确日期任务名、原UTC尝试时间前后120秒且完整列表唯一候选才自动关联，再按编号轮询；已保存此证据的`--resume`仅重做只读核验，不重复创建。真实编号冲突、明确失败、分页无法证实完整、无唯一候选均保留现场；旧无快照仍需显式恢复。离线回归增加`test_hosting_ack`，不以真实订单/创建请求验收。
+- 总编排对其余不确定Hosting状态输出只读恢复计划，不猜编号。核实且取得授权后，原命令增加`--resume --recover-hosting-task-id <已核实编号>`；旧状态另需`--recover-hosting-legacy-mtime`。仅在原export_running阶段允许恢复，不修改已完成批次。
+- 绑定前备份原始字节并两次核对SHA/mtime，在公司锁内原子保存；其余状态保留。创建响应`success:true,data:<编号>`分支有合成回归覆盖，实际响应格式仍需真实证据验证。
+
+## Cookie复用范围
+
+公司流水线在一个SessionScope内运行：登录闸门与下载子进程复用内存快照，17流程不逐个连接浏览器。独立导出进程本身也只获取一次；进程退出不保存Cookie，新命令需重新获取。登录/换公司或过期后结束旧scope并重新获取，服务端公司验证不省略。Magpie登录、官方扩展取Cookie、Python HTTP业务各司其职，无网页桥。

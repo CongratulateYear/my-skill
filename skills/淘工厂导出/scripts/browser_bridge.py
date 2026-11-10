@@ -541,6 +541,8 @@ def make_session(transport: str = "auto", bridge_url: str | None = None) -> Any:
 
 
 def main(argv: list[str] | None = None) -> int:
+    print(json.dumps({'ok': False, 'reason': 'page-bridge-disabled', 'message': 'Use official Playwright Extension'}, ensure_ascii=False))
+    return 3
     parser = argparse.ArgumentParser(description="浏览器内 fetch 桥（只监听 127.0.0.1）")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--print-agent", action="store_true",

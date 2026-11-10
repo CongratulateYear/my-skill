@@ -47,7 +47,10 @@ class Session:
             raise SessionError('认证会话仅允许 www.erp321.com HTTPS；下载外域需独立无凭据连接')
         payload = urlencode(data).encode() if isinstance(data, dict) else data
         if isinstance(payload, str): payload = payload.encode()
-        req = Request(url, data=payload, headers=headers or {}, method=method)
+        # CookieJar owns domain/path/expiry; a compatibility Cookie header
+        # must never override those restrictions.
+        safe_headers = {k: v for k, v in (headers or {}).items() if k.lower() != 'cookie'}
+        req = Request(url, data=payload, headers=safe_headers, method=method)
         try:
             with self.opener.open(req, timeout=timeout) as raw:
                 response = Response(raw)
@@ -119,77 +122,111 @@ def _cookie_session(browser='auto', expect_company=None):
             try:
                 validate_session(session, default_headers(), expect_company)
                 return session
-            except SessionError: continue
-    raise SessionError('没有可验证的聚水潭cookie会话；请登录或启用浏览器桥')
+            except SessionError as exc:
+                if exc.code == 'company_unverified': raise
+                continue
+    raise SessionError('没有可验证的聚水潭cookie会话；请使用官方Playwright扩展获取Cookie')
 
 
 def default_headers():
     return {'accept':'*/*', 'content-type':'application/x-www-form-urlencoded; charset=UTF-8', 'x-requested-with':'XMLHttpRequest', 'referer':ORDER_URL, 'origin':ORIGIN}
 
 
+def _playwright_adapter():
+    """Load only the co-installed login skill; never import arbitrary cwd modules."""
+    import importlib.util
+    import sys
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[2]
+    for name in ('淘工厂登录', 'taogongchang-login'):
+        source = root / name / 'scripts' / 'playwright_session.py'
+        if source.is_file():
+            key = '_tgc_shared_playwright_session'
+            existing = sys.modules.get(key)
+            if existing is not None and Path(existing.__file__).resolve() == source.resolve():
+                return existing
+            spec = importlib.util.spec_from_file_location(key, source)
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[key] = module
+            try:
+                spec.loader.exec_module(module)
+            except Exception:
+                sys.modules.pop(key, None)
+                raise SessionError('官方Playwright会话适配器不可用', 'playwright_unavailable') from None
+            return module
+    raise SessionError('缺少同级淘工厂登录skill的官方Playwright适配器', 'playwright_unavailable')
+
+
+def _playwright_session(browser='auto', expect_company=None):
+    adapter = _playwright_adapter()
+    try:
+        # The shared execution broker keeps ERP separate from Tmall and reuses
+        # this in-memory snapshot across child commands. Never persist cookies.
+        snapshot = adapter.acquire_cookies([ORIGIN + '/'], browser=browser)
+        jar = adapter.cookie_jar(snapshot['cookies'])
+        session = Session(build_opener(NoRedirect(), HTTPCookieProcessor(jar)), 'playwright')
+        headers = default_headers()
+        if snapshot.get('userAgent'):
+            headers['user-agent'] = snapshot['userAgent']
+    except SessionError:
+        raise
+    except Exception as exc:
+        safe_codes = {'playwright_unavailable', 'extension_not_connected', 'browser_not_running',
+                      'unsupported_browser', 'session_expired', 'session_scope_expired',
+                      'broker_unavailable', 'cookie_scope_invalid'}
+        code = getattr(exc, 'code', 'playwright_unavailable')
+        if code not in safe_codes: code = 'playwright_unavailable'
+        raise SessionError('官方Playwright Cookie获取失败；检查现有浏览器及扩展，不输出凭据', code) from None
+    info = validate_session(session, headers, expect_company)
+    return {'session': session, 'headers': headers, 'transport': 'playwright', 'identity': info}
+
+
 def build_session(transport='auto', browser='auto', bridge_url=None, expect_company=None):
-    if transport not in ('auto', 'cookie', 'bridge'): raise ValueError('transport无效')
+    if transport not in ('auto', 'cookie', 'playwright', 'bridge'): raise ValueError('transport无效')
+    if bridge_url:
+        raise SessionError('旧bridge URL已停用；请使用官方Playwright扩展', 'legacy_bridge_disabled')
+    # Legacy spelling is an alias only; no bridge process, injection or request.
+    if transport == 'bridge': transport = 'playwright'
     headers = default_headers()
-    if transport != 'bridge':
+    if transport == 'cookie':
         try:
             session = _cookie_session(browser, expect_company)
-        except SessionError:
-            if transport == 'cookie': raise
+        except SessionError as exc:
+            if transport == 'cookie' or exc.code == 'company_unverified': raise
         else:
             info = validate_session(session, headers, expect_company)
             return {'session':session, 'headers':headers, 'transport':'cookie', 'identity':info}
-    import browser_bridge
-    try:
-        client = browser_bridge.BridgeClient(bridge_url, ensure=False)
-        state = browser_bridge.ping(client.port)
-        if not state.get('ok'):
-            raise SessionError('聚水潭浏览器桥未启动；先由agent后台启动8901桥', 'bridge_not_running')
-        if not state.get('agentAttached'):
-            raise SessionError('桥已启动但ERP标签未注入代理；需agent实际注入', 'bridge_agent_missing')
-        client.wait_ready(0)
-        page = client.session_info().get('page', '')
-        if urlsplit(page).hostname != 'www.erp321.com': raise SessionError('浏览器桥未连接聚水潭页面')
-        session = Session(client, 'bridge')
-        info = validate_session(session, headers, expect_company)
-        return {'session':session, 'headers':headers, 'transport':'bridge', 'identity':info}
-    except SessionError: raise
-    except Exception:
-        raise SessionError('聚水潭浏览器桥不可用；后台启动 browser_bridge.py --port 8901，在已登录ERP的新Magpie标签页注入bridge_agent.js') from None
+    return _playwright_session(browser, expect_company)
 
 
 def recovery_action(reason='session_unverified', expect_company=None, bridge_url=None):
     """Agent-facing plan only: Python cannot inspect or drive Magpie form UI."""
-    from pathlib import Path
-    from urllib.parse import urlsplit
-    port = urlsplit(bridge_url).port if bridge_url else 8901
-    port = port or 8901
     return {
         'reason': reason,
-        'bridgeState': ('not_running' if reason == 'bridge_not_running' else
-                        'agent_missing' if reason == 'bridge_agent_missing' else 'unverified'),
-        'bridgeStartArgv': ['python', str(Path(__file__).with_name('browser_bridge.py')), '--port', str(port)],
-        'bridgeAgentSource': str(Path(__file__).with_name('bridge_agent.js')),
+        'accountSwitchPolicy': 'reuse-logged-in-erp-never-auto-switch',
+        'supportedBrowsers': ['windows-edge', 'macos-chrome'],
         'expectCompany': expect_company,
         'resumePolicy': {'sameInputs': True, 'sameOutputDirectory': True,
                          'preserveTaskState': True, 'addResumeAfterExportAttempt': True,
                          'neverRecreateUncertainTask': True},
         'type': 'inspect-own-magpie-tab',
-        'executor': 'agent-with-magpie-browser',
+        'executor': 'agent-with-magpie-login-and-playwright-cookies',
         'browser': 'current-existing-browser',
         'tab': 'new-own-magpie-tab',
         'workbenchUrl': WORKBENCH_URL,
         'loginUrl': LOGIN_URL,
         'loginState': 'login-or-permission-required' if reason == 'login_or_permission_required' else 'unverified',
         'steps': [
-            'Agent starts bridgeStartArgv as a tracked background job if bridge is not running; Python never injects Magpie.',
+            'Use the current Windows Edge or macOS Chrome with the official Playwright extension; never start a browser or profile.',
             'Open workbench in a new own Magpie tab; do not touch user/other-agent tabs.',
-            'If already signed in, attach bridge and verify server session; do not log out.',
+            'If already signed in to ERP, reuse the session; do not compare accounts, log out or log in again.',
             'If login is needed, inspect the real form refs and only credential presence, never password values.',
             'Preserve prefilled credentials; if both fields are populated, click the real login submit without asking for credentials.',
             'Only fill missing fields using ERP credentials explicitly supplied for this attempt; never use Taogongchang credentials.',
             'Ask once for missing ERP credentials only after inspecting the form; do not extract or persist autofill/passwords.',
             'Stop for human handling of SMS, captcha, slider or risk checks; do not bypass.',
-            'After submitting, attach bridge in the same own ERP tab and rerun server validation with original company constraint.'
+            'After Magpie login, start a fresh execution scope to acquire ERP cookies once with official Playwright, then rerun server validation with the original company constraint.',
+            'ERP checks login state only; never infer its account from Taogongchang or automatically switch accounts. An explicit company validation failure must stop without logging out.'
         ],
         'prefilledCredentials': 'preserve-and-submit',
         'credentialPrompt': 'only-after-form-inspection-if-missing',
@@ -201,7 +238,7 @@ def recovery_action(reason='session_unverified', expect_company=None, bridge_url
 
 def main(argv=None):
     p = argparse.ArgumentParser()
-    p.add_argument('--transport', choices=['auto','cookie','bridge'], default='auto')
+    p.add_argument('--transport', choices=['auto','cookie','playwright','bridge'], default='auto')
     p.add_argument('--browser', default='auto', choices=['auto',*cookies.BROWSERS])
     p.add_argument('--bridge-url')
     p.add_argument('--expect-company')

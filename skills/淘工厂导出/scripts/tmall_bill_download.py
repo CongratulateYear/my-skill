@@ -20,6 +20,7 @@ import functools
 # Emit each progress line immediately, including direct CLI and redirected runs.
 print = functools.partial(builtins.print, flush=True)
 import gzip
+import hashlib
 import json
 import os
 import re
@@ -212,13 +213,13 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--browser", default="auto", choices=["auto", "chrome", "chrome-beta", "chrome-canary", "edge", "brave", "chromium"])
     p.add_argument(
-        "--transport", default="auto", choices=["auto", "cookie", "bridge"],
-        help="登录态来源：auto=cookie 库优先、失败自动回退浏览器桥（默认）；"
-             "cookie=只读浏览器 cookie 库；bridge=借已登录标签页里的 fetch",
+        "--transport", default="auto", choices=["auto", "cookie", "playwright", "bridge"],
+        help="登录态来源：auto=官方Playwright Extension及内存复用（默认）；"
+             "cookie=只读浏览器cookie库；playwright=官方扩展；bridge为playwright兼容别名",
     )
     p.add_argument(
         "--bridge-url", default="",
-        help="浏览器桥地址，默认 http://127.0.0.1:8899（脚本会自动起桥）",
+        help="旧桥已停用；不接受自定义桥地址",
     )
     p.add_argument(
         "--write-off-start",
@@ -617,6 +618,136 @@ def find_task_id(value: Any) -> str | None:
     return next(iter(ids), None)
 
 
+def validate_hosting_task_id(value: Any) -> str:
+    """Normalize hosting IDs without weakening the general FBI string boundary."""
+    if type(value) is int:
+        if not 0 < value <= 2**53 - 1:
+            raise ValueError("hosting taskId 必须为正安全整数")
+        return str(value)
+    value = validate_task_id(value)
+    if value.isdigit() and not 0 < int(value) <= 2**53 - 1:
+        raise ValueError("hosting taskId 必须为正安全整数")
+    return value
+
+
+def hosting_task_id(record: Any) -> str | None:
+    """Read only a hosting record's own IDs, never nested arbitrary id fields."""
+    if not isinstance(record, dict):
+        return None
+    is_task_record = any(key.lower() in {"taskstatus", "taskname", "fileurl"} for key in record)
+    ids = {validate_hosting_task_id(child) for key, child in record.items()
+           if child is not None and (key.lower() in {"taskid", "task_id"}
+                                     or (key == "id" and is_task_record))}
+    if len(ids) > 1:
+        raise ValueError("hosting 响应包含多个不同 taskId，拒绝猜测")
+    return next(iter(ids), None)
+
+
+class HostingCreateConflict(ValueError):
+    """Contradictory task identities or explicit failure must never fall back."""
+
+
+def hosting_create_identity(response: Any) -> tuple[str | None, bool]:
+    """Collect only explicit create-envelope identity slots; ignore invalid ACKs.
+
+    The bool result records malformed ID slots. All valid IDs are collected
+    before deciding, so an invalid alias cannot hide a real-ID conflict.
+    """
+    ids: set[str] = set()
+    invalid = False
+
+    def candidate(value: Any) -> None:
+        nonlocal invalid
+        if value is None:
+            return
+        try:
+            ids.add(validate_hosting_task_id(value))
+        except ValueError:
+            invalid = True
+
+    def visit(node: Any, successful: bool, depth: int) -> None:
+        nonlocal invalid
+        if not isinstance(node, dict):
+            invalid = True
+            return
+        if node.get("success") is False:
+            raise HostingCreateConflict("hosting 创建响应明确失败，禁止自动关联")
+        successful = successful or node.get("success") is True
+        is_task_record = any(key.lower() in {"taskstatus", "taskname", "fileurl"}
+                             for key in node)
+        for key, value in node.items():
+            if key.lower() in {"taskid", "task_id"} or (key == "id" and (successful or is_task_record)):
+                candidate(value)
+        for key in ("data", "result"):
+            value = node.get(key)
+            if isinstance(value, dict):
+                if depth >= 3:
+                    invalid = True
+                else:
+                    visit(value, successful, depth + 1)
+            elif successful:
+                candidate(value)
+
+    visit(response, False, 0)
+    if len(ids) > 1:
+        raise HostingCreateConflict("hosting 响应包含多个不同 taskId，拒绝猜测")
+    return next(iter(ids), None), invalid
+
+
+def hosting_response_shape(response: Any) -> dict[str, Any]:
+    """Bounded types only: no values, arbitrary field names, URLs or payloads."""
+    def shape(node: Any, depth: int) -> Any:
+        # Do not expose arbitrary Python class names from unexpected inputs.
+        kind = next((label for cls, label in ((type(None), 'NoneType'), (bool, 'bool'),
+                    (int, 'int'), (float, 'float'), (str, 'str'), (dict, 'dict'),
+                    (list, 'list')) if type(node) is cls), 'other')
+        result = {"type": kind}
+        if isinstance(node, dict) and depth < 4:
+            result["fields"] = {key: shape(node[key], depth + 1)
+                                for key in ("success", "taskId", "task_id", "id", "data", "result")
+                                if key in node}
+        return result
+    return shape(response, 0)
+
+
+def hosting_created_task_id(response: Any) -> str | None:
+    """Parse explicit IDs in bounded create envelopes, never arbitrary nested IDs.
+
+    Null aliases mean absent, not malformed. Generic ``id`` and scalar data
+    require an explicit success flag; booleans, arrays and conflicting IDs are
+    never coerced or guessed. FBI IDs continue using their stricter boundary.
+    """
+    if not isinstance(response, dict):
+        return None
+    ids: set[str] = set()
+
+    def visit(record: dict[str, Any], successful: bool, depth: int) -> None:
+        if record.get("success") is False:
+            raise ValueError("hosting 创建响应包含失败标记，禁止关联任务")
+        successful = successful or record.get("success") is True
+        task_id = hosting_task_id(record)
+        if task_id is not None:
+            ids.add(task_id)
+        if successful and record.get("id") is not None:
+            ids.add(validate_hosting_task_id(record["id"]))
+        # Only documented-style envelope slots, not lists/metadata/arbitrary trees.
+        for key in ("data", "result"):
+            child = record.get(key)
+            if isinstance(child, dict):
+                if depth >= 3:
+                    raise ValueError("hosting 创建响应包装层数超限")
+                visit(child, successful, depth + 1)
+            elif child is not None and successful:
+                ids.add(validate_hosting_task_id(child))
+
+    if response.get("success") is False:
+        return None
+    visit(response, False, 0)
+    if len(ids) > 1:
+        raise ValueError("hosting 响应包含多个不同 taskId，拒绝猜测")
+    return next(iter(ids), None)
+
+
 def task_state(value: Any, task_id: str) -> tuple[str, str]:
     task_id = validate_task_id(task_id)
     records = []
@@ -990,15 +1121,40 @@ def resume_task(args: argparse.Namespace, module_key: str, dates: dict[str, Any]
     return entry
 
 
+def request_identity_digest(module_key: str, dates: dict[str, Any], query_rows: Any) -> str:
+    """Hash only the non-secret request identity, never headers/URLs/responses."""
+    if module_key not in MODULES or (query_rows is not None and
+            (type(query_rows) is not int or query_rows < 0)):
+        raise ValueError("invalid task request identity")
+    safe_dates = {}
+    if set(dates) - {"orderPayTime", "writeOffTime"}:
+        raise ValueError("invalid task dates")
+    for key, pair in dates.items():
+        if not isinstance(pair, dict) or set(pair) != {"start", "end"}:
+            raise ValueError("invalid task dates")
+        for value in pair.values():
+            if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+                raise ValueError("invalid task dates")
+            date.fromisoformat(value)
+        safe_dates[key] = dict(pair)
+    encoded = json.dumps({"module": module_key, "dates": safe_dates, "queryRows": query_rows},
+                         ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def create_tracked_task(args: argparse.Namespace, module_key: str, dates: dict[str, Any],
-                        query_rows: Any, create: Any) -> str:
+                        query_rows: Any, create: Any, *, extractor: Any = find_task_id) -> str:
     state = args._task_state
-    entry = {"phase": "creating", "dates": dates, "queryRows": query_rows}
+    entry = {"phase": "creating", "dates": dates, "queryRows": query_rows,
+             "attemptStartedAt": datetime.now(timezone.utc).isoformat(),
+             "requestIdentitySha256": request_identity_digest(module_key, dates, query_rows)}
     state.setdefault("remoteTasks", {})[module_key] = entry
     # Write-ahead intent: failures here occur BEFORE any creation request.
     save_state(args._task_state_file, state)
     created = create()
-    task_id = find_task_id(created)
+    task_id = extractor(created)
+    if task_id is not None:
+        task_id = validate_task_id(task_id)
     if task_id is None:
         raise RuntimeError("创建请求已返回但没有 taskId；禁止自动重建，需人工核实远端任务")
     entry.update(phase="created", taskId=task_id)
@@ -1222,6 +1378,133 @@ def run_sequence(module_keys: list[str], runner: Any) -> list[dict[str, Any]]:
     return results
 
 
+def hosting_complete_records(session: Any, headers: dict[str, str]) -> list[dict[str, Any]]:
+    """Read bounded complete pages, rejecting ignored pagination or malformed IDs."""
+    ids: set[str] = set()
+    all_records: list[dict[str, Any]] = []
+    for page in range(1, 101):
+        _, response = post(session, f"{HOSTING_BASE}/task/pageListDownloadTask", headers,
+                           {"pageNo": page, "pageSize": 100})
+        records = hosting_task_records(response)
+        if not records:
+            data = response.get("data") if isinstance(response, dict) else None
+            empty = data == [] or (isinstance(data, dict) and any(
+                data.get(key) == [] for key in ("list", "records", "rows", "items")))
+            if not empty:
+                raise ValueError("hosting 完整列表结构无法验证，停止创建或关联")
+            return all_records
+        page_ids = []
+        for record in records:
+            task_id = hosting_task_id(record)
+            if task_id is None or task_id in ids or task_id in page_ids:
+                raise ValueError("hosting 完整列表编号缺失或重复，停止创建或关联")
+            page_ids.append(task_id)
+        ids.update(page_ids)
+        all_records.extend(records)
+        # Servers may silently cap pageSize: only an explicit empty next page
+        # establishes completion. Ignored pageNo yields duplicate IDs and stops.
+    raise ValueError("hosting 完整列表超出安全分页上限，停止创建或关联")
+
+
+def hosting_snapshot_ids(session: Any, headers: dict[str, str]) -> list[str]:
+    return sorted(hosting_task_id(record) for record in hosting_complete_records(session, headers))
+
+
+def hosting_bind_new_task(entry: dict[str, Any], session: Any,
+                          headers: dict[str, str]) -> str:
+    """Associate only a unique new exact-name task in the original time window."""
+    snapshot = entry.get("hostingSnapshotTaskIds")
+    if not isinstance(snapshot, list) or any(not isinstance(x, str) for x in snapshot):
+        raise RuntimeError("旧 creating 没有创建前快照，必须显式核实恢复")
+    before = {validate_hosting_task_id(x) for x in snapshot}
+    if len(before) != len(snapshot):
+        raise ValueError("hosting 创建前快照包含重复任务编号")
+    dates = entry["dates"]
+    if entry.get("requestIdentitySha256") != request_identity_digest(
+            "all-item-effects-export", dates, entry.get("queryRows")):
+        raise ValueError("hosting 请求身份摘要不一致")
+    moment = datetime.fromisoformat(entry["attemptStartedAt"])
+    if moment.tzinfo is None or moment.utcoffset().total_seconds() != 0:
+        raise ValueError("hosting 创建时间必须是UTC")
+    pair = dates["orderPayTime"]
+    expected = ("投流推广_推广佣金_推广明细_" + pair["start"].replace("-", "")
+                + "至" + pair["end"].replace("-", ""))
+    for attempt in range(HOSTING_MAX_POLLS):
+        candidates = []
+        seen: set[str] = set()
+        for record in hosting_complete_records(session, headers):
+            task_id = hosting_task_id(record)
+            if task_id is None:
+                raise ValueError("hosting 创建后列表缺少任务编号")
+            if task_id in seen:
+                raise ValueError("hosting 创建后列表包含重复任务编号")
+            seen.add(task_id)
+            if task_id in before or record.get("taskName") != expected:
+                continue
+            created = record.get("createTime")
+            if type(created) is not int or created <= 0:
+                raise ValueError("hosting 候选任务创建时间非法")
+            if abs(created / 1000 - moment.timestamp()) <= 120:
+                candidates.append(task_id)
+        if len(candidates) > 1:
+            raise ValueError("hosting 新增任务证据不唯一，禁止自动关联")
+        if candidates:
+            return candidates[0]
+        if attempt + 1 < HOSTING_MAX_POLLS:
+            time.sleep(HOSTING_POLL_SECONDS)
+    raise RuntimeError("hosting 未找到唯一新增任务；保留 creating，禁止重新创建")
+
+
+def create_hosting_tracked_task(args: argparse.Namespace, module_key: str,
+                                dates: dict[str, Any], session: Any,
+                                headers: dict[str, str], create: Any) -> str:
+    state = args._task_state
+    entry = state.get("remoteTasks", {}).get(module_key)
+    if entry is not None:
+        if not args.resume or entry.get("dates") != dates:
+            raise ValueError("hosting 任务已存在或日期不一致")
+        if entry.get("phase") == "created":
+            return validate_task_id(entry.get("taskId"))
+        if entry.get("phase") != "creating" or entry.get("hostingFallbackAllowed") is not True:
+            raise RuntimeError("hosting 不确定创建需显式恢复；禁止重新创建")
+        task_id = hosting_bind_new_task(entry, session, headers)
+        association = "verified_snapshot"
+    else:
+        # Snapshot is read-only; save the intent before the single create call.
+        snapshot = hosting_snapshot_ids(session, headers)
+        entry = {"phase": "creating", "dates": dates, "queryRows": None,
+                 "hostingSnapshotTaskIds": snapshot,
+                 "attemptStartedAt": datetime.now(timezone.utc).isoformat(),
+                 "requestIdentitySha256": request_identity_digest(module_key, dates, None)}
+        state.setdefault("remoteTasks", {})[module_key] = entry
+        save_state(args._task_state_file, state)
+        response = create()
+        entry["hostingResponseShape"] = hosting_response_shape(response)
+        try:
+            task_id, invalid = hosting_create_identity(response)
+        except HostingCreateConflict:
+            entry["hostingFallbackAllowed"] = False
+            save_state(args._task_state_file, state)
+            raise
+        entry["hostingInvalidIdSlots"] = invalid
+        entry["hostingFallbackAllowed"] = task_id is None
+        save_state(args._task_state_file, state)
+        association = "direct_id"
+        if task_id is None:
+            task_id = hosting_bind_new_task(entry, session, headers)
+            association = "verified_snapshot"
+    # Fixed labels + bounded type-only structure; no raw response, URL or auth.
+    entry.update(phase="created", taskId=task_id, hostingAssociation=association)
+    try:
+        save_state(args._task_state_file, state)
+    except BaseException:
+        entry.pop("taskId", None)
+        entry.pop("hostingAssociation", None)
+        entry["phase"] = "creating"
+        raise
+    return task_id
+
+
 def execute_export_module(
     args: argparse.Namespace,
     session: Any,
@@ -1243,11 +1526,10 @@ def execute_export_module(
         "startDate": pair["start"].replace("-", ""),
         "endDate": pair["end"].replace("-", ""),
     })
-    existing = resume_task(args, module_key, date_filters)
-    created_task_id = (existing["taskId"] if existing else create_tracked_task(
-        args, module_key, date_filters, None,
+    created_task_id = create_hosting_tracked_task(
+        args, module_key, date_filters, session, headers,
         lambda: get_json(session, f"{HOSTING_BASE}/task/createDownloadTask?{create_query}", headers),
-    ))
+    )
     print(f"导出任务：{created_task_id}")
     time.sleep(HOSTING_POLL_SECONDS)
 
@@ -1256,8 +1538,11 @@ def execute_export_module(
     status = ""
     for attempt in range(1, HOSTING_MAX_POLLS + 1):
         _, status_response = post(session, f"{HOSTING_BASE}/task/pageListDownloadTask", headers, poll_payload)
-        record = next((item for item in hosting_task_records(status_response)
-                       if find_task_id(item) == created_task_id), None)
+        matches = [item for item in hosting_task_records(status_response)
+                   if hosting_task_id(item) == created_task_id]
+        if len(matches) > 1:
+            raise ValueError("hosting 列表包含重复任务编号，拒绝选择首条")
+        record = matches[0] if matches else None
         status = hosting_status(record) if record else ""
         print(f"轮询 {attempt}/{HOSTING_MAX_POLLS}：taskStatus={status or '未找到任务记录'}")
         if status == "FINISHED":
@@ -1662,6 +1947,13 @@ def main() -> int:
     # Reject ambiguous/legacy attempts before loading any authentication data.
     for key in module_keys:
         if MODULES[key].get("api_style") != "rules-center":
+            entry = args._task_state.get("remoteTasks", {}).get(key)
+            if (MODULES[key].get("api_style") == "hosting" and isinstance(entry, dict)
+                    and entry.get("phase") == "creating"
+                    and entry.get("hostingFallbackAllowed") is True
+                    and isinstance(entry.get("hostingSnapshotTaskIds"), list)
+                    and entry.get("dates") == dates_by_module[key]):
+                continue  # New snapshot-backed ACK attempts only; never recreate.
             resume_task(args, key, dates_by_module[key])
     if query_request:
         base_headers = headers_from(query_request)
