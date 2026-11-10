@@ -10,12 +10,8 @@ Prints ONE JSON object on stdout so callers can branch on it, and exits with:
                   browser; fill the login form only when logged out
   1  ERROR        unexpected failure (keychain / DPAPI / decrypt / cookie db)
 
-Transport: --transport auto (default) reads the local cookie store first and
-falls back to the browser bridge bundled with this skill (browser_bridge.py +
-bridge_agent.js read and evaluated in the agent's NEW own Magpie tab on
- tgc.tmall.com) when the store cannot be
-read at all (Windows v20 app-bound encryption, Edge-exclusive Cookies file,
-sandbox denying the temp area).
+Transport: --transport auto (default) uses official Playwright Extension and RAM scope reuse. Explicit cookie mode
+retains native cookie-store compatibility without cross-process memory reuse.
 
 This script never opens a browser window, never launches a second browser, and
 never touches a password: driving the form is the agent's job (SKILL.md
@@ -55,16 +51,15 @@ RECOVERY_ROUTE = (
     "不复用用户、其他 agent 或旧标签页，不新开浏览器或 profile。"
     "同一次恢复继续用自己新建的同一标签页，不必每步再开。"
     "打开 https://tgc.tmall.com/ds/page/supplier/home，用 snapshot 判断："
-    "已登录则直接桥接，只有确认未登录才打开 https://tgcwork.tmall.com/login 填表。"
-    "凭据只用于本次表单，不落盘、不回显；补账号后再次检查密码是否有值，保留自动填充。"
-    "缺凭据只询问一次，无新输入不重复催问；不得把含凭据历史恢复到临时文件。"
-    "验证码、滑块和短信验证由用户人工完成。"
-    "后台启动本 skill 的 scripts/browser_bridge.py --port 8899；"
-    "用 read 读取本 skill 的 scripts/bridge_agent.js 源码，在自己标签页的 tgc.tmall.com 页面"
-    "用 evaluate 直接执行整段源码；不要插入 script src。导航或换号后重新 read 并 evaluate。"
+    "已登录则不要退出，确认未登录才打开登录页真实填表。"
+    "凭据只用于 Magpie 表单，不落盘、不回显，不写 shell、文件或日志；验证码由用户人工完成。"
+    "补账号后再次检查密码是否有值，保留自动填充。缺凭据只询问一次，无新输入不重复催问；"
+    "不得把含凭据历史恢复到临时文件。"
+    "登录完成后使用官方 Playwright Extension 读取 Cookie，不启动页面桥或注入脚本。"
+    "更换公司或登录恢复后须结束旧执行 scope，并开始新的内存 scope；不静默刷新旧缓存。"
     "随后重跑本命令（保留 --expect-company / --expect-account）；"
     "有目标公司时必须传 --expect-company，以服务端公司验证通过且退出码 0 为成功标准，"
-    "页面跳转、agent started、桥已连接或 erpMobile 有值均不代表成功。"
+    "页面跳转、扩展已连接或 erpMobile 有值均不代表成功。"
 )
 
 ACTION = {
@@ -140,7 +135,7 @@ def probe(
         "transport": built["transport"],
         "accountHint": tmall_session.account_hint(headers),
         "erpMobile": erp_mobile,
-        "cookieCount": len(str(headers.get("cookie", "")).split("; ")),
+        "cookieCount": len([c for c in str(headers.get("cookie", "")).split("; ") if c]),
         "hasXsrf": "x-xsrf-token" in headers,
         "company": company,
         "companyDetail": company_detail,
@@ -160,8 +155,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--browser", default="auto", choices=[*tmall_session.BROWSERS, "auto"])
     parser.add_argument("--domain", default=tmall_session.DEFAULT_DOMAIN)
     parser.add_argument("--transport", default="auto", choices=tmall_session.TRANSPORTS,
-                        help="auto=cookie 库优先、失败回退浏览器桥；cookie=只读 cookie 库；bridge=只用页面桥")
-    parser.add_argument("--bridge-url", default="", help="桥地址，默认 http://127.0.0.1:8899")
+                        help="auto/playwright=官方扩展与执行范围内存复用；cookie=显式旧原生库；bridge=playwright兼容别名")
+    parser.add_argument("--bridge-url", default="", help="已弃用；不会连接旧页面桥")
     parser.add_argument("--wait", type=float, default=0.0,
                         help="浏览器里刚点完登录时，最多等这么多秒让 cookie 落库")
     parser.add_argument("--interval", type=float, default=2.0, help="轮询间隔秒数")

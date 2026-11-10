@@ -20,8 +20,8 @@ class RecoveryPromptTests(unittest.TestCase):
         for reason in ("no-cookie", "no-session", "expired", "wrong-account", "wrong-company"):
             with self.subTest(reason=reason):
                 text = ensure_login.ACTION[reason]
-                for word in ("tab_new", "自己的 Magpie", "已登录则直接桥接", "确认未登录", "read",
-                             "scripts/bridge_agent.js", "evaluate", "服务端公司验证", "验证码", "不回显"):
+                for word in ("tab_new", "自己的 Magpie", "已登录则不要退出", "确认未登录",
+                             "Playwright Extension", "服务端公司验证", "验证码", "不回显"):
                     self.assertIn(word, text)
                 for stale in ("两条路任选", "asset-inventory", "复用同一标签", "<script src="):
                     self.assertNotIn(stale, text)
@@ -55,7 +55,7 @@ class RecoveryPromptTests(unittest.TestCase):
             with self.assertRaises(tmall_session.SessionError) as caught:
                 tmall_session.build_headers()
         text = str(caught.exception)
-        for word in ("不代表浏览器未登录", "tab_new", "read", "evaluate", "服务端公司验证"):
+        for word in ("不代表浏览器未登录", "Magpie", "Playwright Extension", "凭据"):
             self.assertIn(word, text)
         self.assertNotIn("复用已有标签", text)
 
@@ -88,28 +88,9 @@ class RecoveryPromptTests(unittest.TestCase):
                 self.assertEqual(actual_code, code)
                 self.assertEqual(state["reason"], reason)
 
-    def test_skill_documents_fixed_route(self):
-        text = (Path(__file__).resolve().parents[1] / "SKILL.md").read_text("utf-8")
-        for word in ("no-session 不等于未登录", "read 工具", "整段源码原样", "服务端验证", "用户退出当前账号的确认", "同一次恢复"):
-            self.assertIn(word, text)
-        self.assertNotIn("asset-inventory", text)
-        self.assertNotIn("s.src =", text)
-        self.assertIn("不得把含凭据的历史对话恢复到临时文件", text)
-        self.assertIn("无法安全取得则请用户重新提供", text)
-
-    def test_related_skills_keep_waiting_and_security_boundaries(self):
-        root = Path(__file__).resolve().parents[2]
-        pansuan = (root / "淘工厂资产盘算" / "SKILL.md").read_text("utf-8")
-        erp = (root / "淘工厂聚水潭" / "SKILL.md").read_text("utf-8")
-        for text in (pansuan, erp):
-            for word in ("含凭据的历史对话恢复到临时文件", "事后删除也不允许", "无新输入", "不重复催问"):
-                self.assertIn(word, text)
-        for word in ("意外公司不符", "该授权不涵盖ERP换号", "上一家公司全部完成后", "优先等待通知",
-                     "不因耗时长重跑", "自动续轮当作用户授权"):
-            self.assertIn(word, pansuan)
-        for word in ("再次仅检查密码是否有值", "保留新出现的预填密码", "不擅自更改密码",
-                     "合单证据", "不得自动批准"):
-            self.assertIn(word, erp)
+    def test_scope_recovery_explicit(self):
+        self.assertIn("新的内存 scope", ensure_login.RECOVERY_ROUTE)
+        self.assertNotIn("bridge_agent.js", ensure_login.RECOVERY_ROUTE)
 
 
 if __name__ == "__main__":

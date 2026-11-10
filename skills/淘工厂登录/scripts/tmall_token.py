@@ -1,29 +1,7 @@
 #!/usr/bin/env python3
-"""Fetch the tmall API token (XSRF) for the CURRENT browser session.
-
-Prints ONE JSON object on stdout:
-
-    {
-      "ok": true,
-      "accountHint": "scm65253097",
-      "xsrfToken": "....",
-      "cookieCount": 37
-    }
-
-Exit codes (same contract as ensure_login.py):
-  0  ok           headers + token ready in the JSON on stdout
-                 (and, with --expect-company, the logged-in company matches)
-  3  need-login   run the SKILL.md login flow first, then re-run
-                 (reasons: no-cookie / expired / wrong-account / wrong-company
-                  / company-unknown)
-  1  error        unexpected failure
-
-The XSRF token is a session credential. It lives in the caller's memory only:
-never echo it into chat replies, logs, state files, or documents. Use
---with-headers to also receive the full ready-to-use header dict (cookie
-included) for immediate in-process API calls; do not persist it anywhere.
-
-    python3 tmall_token.py --with-headers | python3 -c 'import json,sys; print(json.load(sys.stdin)["headers"]["x-xsrf-token"])'
+"""Secret-safe session diagnostic. Never outputs cookies, headers or XSRF.
+Use tmall_session.build_session() in process for actual authenticated requests.
+Legacy --with-headers is rejected; CLI output is status metadata only.
 """
 from __future__ import annotations
 
@@ -55,8 +33,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--browser", default="auto", choices=[*tmall_session.BROWSERS, "auto"])
     parser.add_argument("--domain", default=tmall_session.DEFAULT_DOMAIN)
     parser.add_argument("--transport", default="auto", choices=tmall_session.TRANSPORTS,
-                        help="auto=cookie 库优先、失败回退浏览器桥；cookie=只读 cookie 库；bridge=只用页面桥")
-    parser.add_argument("--bridge-url", default="", help="桥地址，默认 http://127.0.0.1:8899")
+                        help="auto/playwright=官方扩展内存复用；cookie=显式原生库；bridge=兼容别名")
+    parser.add_argument("--bridge-url", default="", help="已弃用，不连接旧页面桥")
     parser.add_argument("--expect-account", default="",
                         help="期望登录的账号（手机号或账号提示）；不一致时输出 wrong-account 并退出 3")
     parser.add_argument("--expect-company", default="",
@@ -140,13 +118,15 @@ def main(argv: list[str] | None = None) -> int:
         "accountHint": tmall_session.account_hint(headers),
         "company": company_seen[0] if company_seen else "",
         "cookieCount": len(headers.get("cookie", "").split("; ")),
-        "xsrfToken": headers.get("x-xsrf-token", ""),
+        "hasXsrf": bool(headers.get("x-xsrf-token", "")),
         "waitedSeconds": round(time.monotonic() - started, 1),
     }
     if note_seen:
         payload["note"] = note_seen[0]
     if args.with_headers:
-        payload["headers"] = headers
+        print(json.dumps({"ok": False, "reason": "secret-output-disabled",
+                          "action": "Use tmall_session.build_session in process; CLI never prints cookies or tokens."}))
+        return EXIT_ERROR
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     print(f"token 已获取：{payload['accountHint']}", file=sys.stderr)
     return EXIT_OK
