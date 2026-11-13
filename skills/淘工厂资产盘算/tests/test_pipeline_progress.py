@@ -283,7 +283,9 @@ class ProgressTests(unittest.TestCase):
                 with contextlib.redirect_stdout(io.StringIO()) as diagnostic:
                     self.assertEqual(c.execute(args,folder,['export'],None,runner,
                         lambda _: self.fail('invalid state must fail closed before session'),None,lambda *a:root/'jushuitan.py'),2)
-                self.assertEqual(json.loads(diagnostic.getvalue())['error_code'],'state_invalid')
+                records = [json.loads(line) for line in diagnostic.getvalue().splitlines()]
+                self.assertEqual(records[0]['error_code'], 'state_invalid')
+                self.assertEqual(records[-1]['summary']['execution_status'], 'failed')
                 self.assertEqual(len(calls),before+1)  # offline prepare only, no actual ERP task
             self.assertEqual(sum(cmd[0] == 'export' for cmd in calls),1)
             self.assertNotIn('--scope-approval-file', next(cmd for cmd in reversed(calls) if '--prepare-only' in cmd))

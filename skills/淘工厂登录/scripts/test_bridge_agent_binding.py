@@ -204,7 +204,14 @@ async function run(source, conflictAt) {
       return {status: 200, ok: true};
     }};
   vm.createContext(context);
-  assert.equal(vm.runInContext(source, context), "bridge agent started");
+  const status = vm.runInContext(source, context);
+  if (typeof status === 'string' && (status.startsWith('Page bridge disabled.') || status.startsWith('page-bridge-disabled:'))) {
+    assert.match(status, /official Playwright Extension/);
+    assert.equal(calls.length, 0);
+    assert.equal(business, 0);
+    return;
+  }
+  assert.equal(status, "bridge agent started");
   for (let i = 0; i < 20 && context.window.__dshBridgeRunning; i++) await new Promise(resolve => setImmediate(resolve));
   assert.equal(context.window.__dshBridgeRunning, false);
   assert.equal(business, conflictAt === "/next" ? 0 : 1);

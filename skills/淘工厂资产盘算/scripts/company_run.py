@@ -127,27 +127,74 @@ def save(path, value):
     os.replace(temp, path)
 
 
+def export_support():
+    scripts = Path(__file__).resolve().parents[2] / '淘工厂导出' / 'scripts'
+    if str(scripts) not in sys.path:
+        sys.path.insert(0, str(scripts))
+    return scripts
+
+
 @contextmanager
 def locked(path):
-    with path.open('a+b') as stream:
-        stream.seek(0); stream.write(b'0'); stream.flush(); stream.seek(0)
-        try:
-            if os.name == 'nt':
-                import msvcrt
-                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            raise ValueError('公司目录正在执行；禁止并发') from None
-        try:
-            yield
-        finally:
-            stream.seek(0)
-            if os.name == 'nt':
-                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                fcntl.flock(stream, fcntl.LOCK_UN)
+    export_support()
+    from company_lock import locked as shared_locked
+    with shared_locked(path) as ownership:
+        yield ownership
+
+
+def hosting_recovery(args, state_root, ownership):
+    """Inspect only this company's current work; never select a remote ID.
+
+    Called with the parent's lock held, before spawning the export child.
+    """
+    import argparse
+    export_support()
+    import recover_hosting_task as recovery
+    work = state_root / ('.work-' + args.canonical_module)
+    states = list(work.glob('*.asset-inventory-state.json')) if work.is_dir() else []
+    explicit_id = getattr(args, 'recover_hosting_task_id', None)
+    if len(states) != 1:
+        if explicit_id is not None:
+            raise ValueError('hosting recovery requires unique current export state')
+        return True
+    path = states[0]
+    original = path.read_bytes()
+    state = json.loads(original)
+    entry = state.get('remoteTasks', {}).get(recovery.MODULE)
+    uncertain = isinstance(entry, dict) and entry.get('phase') == 'creating'
+    if not uncertain:
+        if explicit_id is not None:
+            raise ValueError('explicit hosting recovery requires uncertain creating state')
+        return True
+    expected_dates = {'orderPayTime': {'start': args.order_pay_start, 'end': args.order_pay_end}}
+    if (state.get('scope') != args.canonical_module or state.get('shopName') != args.company_name
+            or state.get('expectedCompany') != args.company_name or entry.get('dates') != expected_dates):
+        raise ValueError('hosting recovery company/scope/dates mismatch')
+    if (explicit_id is None and entry.get('hostingFallbackAllowed') is True
+            and isinstance(entry.get('hostingSnapshotTaskIds'), list)):
+        # The downloader validates digest/time/snapshot and the unique remote
+        # candidate under this same company lock; this is not an ID guess.
+        return True
+    plan = {'module': recovery.MODULE, 'bound': False, 'read_only': True,
+            'state_file': str(path), 'expected_state_sha256': hashlib.sha256(original).hexdigest(),
+            'company_lock': str(state_root / '.company-run.lock'),
+            'attemptStartedAt': entry.get('attemptStartedAt'),
+            'requestIdentitySha256': entry.get('requestIdentitySha256'),
+            'legacy_mtime_optin_required': 'attemptStartedAt' not in entry,
+            'next_action': 'verify_exact_remote_task_then_resume_with_explicit_id',
+            'resume_arguments': ['--resume', '--recover-hosting-task-id', '<verified-task-id>'],
+            'automatic_binding': False}
+    if explicit_id is None:
+        print(json.dumps({'stage': 'hosting_recovery_required', 'recovery': plan}, ensure_ascii=False), flush=True)
+        return False
+    result = recovery.recover(argparse.Namespace(
+        state_file=path, expected_state_sha256=plan['expected_state_sha256'],
+        expect_company=args.company_name, task_id=explicit_id, bind=True,
+        company_lock=state_root / '.company-run.lock',
+        allow_legacy_mtime=getattr(args, 'recover_hosting_legacy_mtime', False),
+        transport=args.transport, browser=args.browser), lock_ownership=ownership)
+    print(json.dumps({'stage': 'hosting_recovery_verified', 'recovery': result}, ensure_ascii=False), flush=True)
+    return True
 
 
 def erp_recovery_status(readiness):
@@ -157,11 +204,12 @@ def erp_recovery_status(readiness):
     recovery = readiness.get('recovery_action') or readiness.get('action')
     if isinstance(recovery, dict) and isinstance(recovery.get('reason'), str):
         codes.add(recovery['reason'])
-    bridge = {'bridge_not_running', 'bridge_agent_missing', 'bridge_agent_not_connected',
-              'bridge_unavailable', 'bridge_timeout'}
+    connection = {'playwright_unavailable', 'extension_not_connected', 'browser_not_running',
+                  'session_broker_unavailable', 'session_cache_expired', 'unsupported_browser',
+                  'playwright_timeout', 'extension_connection_required'}
     return {
         'execution_status': 'awaiting_agent',
-        'recovery_kind': 'bridge_connection' if codes & bridge else 'session_inspection',
+        'recovery_kind': 'playwright_connection' if codes & connection else 'session_inspection',
         'next_action': 'recover_own_erp_tab_then_resume',
         'user_input_required': 'not_established',
         'resume_required': True,
@@ -346,12 +394,68 @@ def delivery_summary(journal, folder, main_workbook=None):
     }
 
 
+def record_handoff(journal, journal_path, service, diagnostic):
+    """Bounded agent handoff, never login automation or authorization.
+
+    One failed explicit resume with the same verified cause exhausts automatic
+    agent recovery. User waits stay waits; new evidence must come from a gate.
+    """
+    from pansuan_pipeline import safe_diagnostic
+    clean = safe_diagnostic(diagnostic)
+    codes = {clean.get(key) for key in ('reason', 'error_code', 'session_status')}
+    human = {'captcha_required', 'sms_required', 'slider_required', 'credentials_required',
+             'missing_credentials', 'permission_denied', 'scope_approval_required', 'risk_check_required'}
+    expected = {'wrong-company', 'wrong-account', 'company-unknown', 'no-session', 'no-cookie',
+                'expired', 'wrong_company', 'not_logged_in', 'login_required', 'login-required', 'session_expired',
+                'login_or_permission_required', 'session_unverified',
+                'playwright_unavailable', 'extension_not_connected', 'browser_not_running',
+                'session_broker_unavailable', 'session_cache_expired', 'unsupported_browser',
+                'playwright_timeout', 'extension_connection_required'}
+    reason = next((clean[key] for key in ('session_status', 'error_code', 'reason')
+                   if clean.get(key) in human | expected), 'unclassified')
+    status = 'awaiting_user' if codes & human else 'awaiting_agent' if codes & expected else 'failed'
+    previous = journal.get('recovery') or {}
+    attempt = previous.get('agent_attempts', 0) if previous.get('service') == service and previous.get('reason') == reason else 0
+    if status == 'awaiting_agent':
+        attempt += 1
+        if attempt > 1:
+            status = 'failed'
+    recovery = {'service': service, 'reason': reason, 'execution_status': status,
+                'recovery_kind': 'company_switch' if service == 'taogongchang' and reason in ('wrong-company', 'wrong_company', 'wrong-account') else 'session_inspection',
+                'erp_account_switch_allowed': False,
+                'next_action': 'handle_user_requirement_then_resume' if status == 'awaiting_user' else
+                    'inspect_and_report_no_repeated_recovery' if status == 'failed' else
+                    'recover_own_magpie_tab_then_explicit_resume',
+                'resume_required': True, 'python_controls_browser': False,
+                'agent_attempts': attempt, 'max_agent_attempts': 1,
+                'validation_required': 'original_server_gate', 'never_recreate_uncertain_task': True}
+    journal['recovery'] = recovery
+    save(journal_path, journal)
+    return recovery
+
+
 def execute(args, folder, export_cmd, merge_cmd, run, gate, gate_cmd, resolve):
+    if (getattr(args, 'recover_hosting_legacy_mtime', False) and
+            getattr(args, 'recover_hosting_task_id', None) is None):
+        raise ValueError('legacy mtime opt-in requires explicit hosting recovery task ID')
+    if (getattr(args, 'recover_hosting_task_id', None) is not None or
+            getattr(args, 'recover_hosting_legacy_mtime', False)) and not args.resume:
+        raise ValueError('hosting recovery requires explicit --resume')
     if getattr(args, 'erp_scope_approval_file', None) and not args.resume:
         raise ValueError('ERP范围授权只能显式 --resume 使用')
     with Progress(getattr(args, 'heartbeat_interval', 60.0)) as progress:
+        progress.handoff = None
         result = _execute(args, folder, export_cmd, merge_cmd, run, gate, gate_cmd, resolve, progress)
         progress.result = result
+        if result:
+            from tgc_runtime import runtime_for
+            path = runtime_for(folder) / '.company-run.json'
+            journal = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
+            summary = delivery_summary(journal, folder)
+            recovery = progress.handoff or {}
+            summary['execution_status'] = recovery.get('execution_status', 'failed')
+            summary['recovery'] = recovery or None
+            print(json.dumps({'summary': summary}, ensure_ascii=False), flush=True)
         return result
 
 
@@ -370,7 +474,7 @@ def _execute(args, folder, export_cmd, merge_cmd, run, gate, gate_cmd, resolve, 
     state_root.mkdir(parents=True, exist_ok=True)
     journal_path = state_root / '.company-run.json'
     folder.mkdir(parents=True, exist_ok=True)
-    with locked(state_root / '.company-run.lock'):
+    with locked(state_root / '.company-run.lock') as ownership:
         progress.set_stage('resume_verification')
         if journal_path.exists():
             if not args.resume:
@@ -393,6 +497,8 @@ def _execute(args, folder, export_cmd, merge_cmd, run, gate, gate_cmd, resolve, 
             journal = {'version': 1, 'identity': identity, 'run_id': uuid.uuid4().hex,
                        'stage': 'new'}
             save(journal_path, journal)
+        if getattr(args, 'recover_hosting_task_id', None) is not None and journal['stage'] != 'export_running':
+            raise ValueError('hosting recovery only valid while resuming export_running')
         receipt_path = state_root / '.export-result.json'
         erp_result = state_root / '.erp-result.json'
         # Recover a publication that succeeded just before journal checkpoint.
@@ -402,23 +508,30 @@ def _execute(args, folder, export_cmd, merge_cmd, run, gate, gate_cmd, resolve, 
                 candidate = json.loads(receipt_path.read_text(encoding='utf-8'))
                 if candidate.get('run_id') == journal['run_id']:
                     receipt = candidate
+            if receipt is not None and getattr(args, 'recover_hosting_task_id', None) is not None:
+                raise ValueError('export already published; hosting recovery not applicable')
             if receipt is None:
+                if args.resume and not hosting_recovery(args, state_root, ownership):
+                    return 2
                 if gate_cmd:
-                    rc, _ = progress.call('login', gate, gate_cmd)
+                    rc, readiness = progress.call('login', gate, gate_cmd)
                     if rc:
+                        progress.handoff = record_handoff(journal, journal_path, 'taogongchang', readiness)
                         return rc
-                # Advisory local connectivity only: no cookie/session/order query,
-                # no bridge startup and no ERP identity assumption before fines exist.
-                if getattr(args, 'erp_transport', 'cookie') != 'cookie':
-                    from orchestration_policy import bridge_precheck
-                    print(json.dumps({'type': 'erp_bridge_precheck',
-                        **bridge_precheck(getattr(args, 'erp_bridge_url', None))}, ensure_ascii=False), flush=True)
+                    journal.pop('recovery', None)
                 journal['stage'] = 'export_running'; save(journal_path, journal)
                 command = [c for c in export_cmd if c != '--resume']
                 if args.resume and (state_root / ('.work-' + args.canonical_module)).exists():
                     command.append('--resume')
                 rc = progress.call('export', run, command + ['--state-dir', str(state_root), '--result-file', str(receipt_path), '--run-id', journal['run_id']])
                 if rc:
+                    diagnostic = getattr(run, 'last_diagnostic', {})
+                    # Only the child's sanitized service evidence can establish a
+                    # login handoff; uncertain task recovery remains untouched.
+                    if diagnostic:
+                        progress.handoff = record_handoff(journal, journal_path, 'taogongchang', diagnostic)
+                    if getattr(args, 'recover_hosting_task_id', None) is None:
+                        hosting_recovery(args, state_root, ownership)
                     return rc
                 receipt = json.loads(receipt_path.read_text(encoding='utf-8'))
             if (receipt.get('run_id') != journal['run_id'] or receipt.get('company') != args.company_name
@@ -514,10 +627,10 @@ def _execute(args, folder, export_cmd, merge_cmd, run, gate, gate_cmd, resolve, 
                                 session_command += ['--bridge-url',args.erp_bridge_url]
                             rc, readiness = progress.call('erp_session', gate, session_command)
                             if rc or readiness.get('ok') is not True:
-                                print(json.dumps({'company':args.company_name,'stage':'erp_preparation_required',
-                                    **erp_recovery_status(readiness), 'matching_status':'not_started',
-                                    'recovery':readiness,'resume':'原命令 --resume；不重导账单，不切换下一家公司'},ensure_ascii=False),flush=True)
+                                progress.handoff = record_handoff(journal, journal_path, 'erp', readiness)
                                 return rc or 3
+                            journal.pop('recovery', None)
+                            save(journal_path, journal)
                         if getattr(args, 'erp_scope_approval_file', None):
                             command += ['--scope-approval-file', str(args.erp_scope_approval_file)]
                         rc = progress.call('erp', run, command)
@@ -534,6 +647,11 @@ def _execute(args, folder, export_cmd, merge_cmd, run, gate, gate_cmd, resolve, 
                                 # Re-read exact current result after the bounded attempt.
                                 recovery = erp_failure_recovery(erp_result, erp_state,
                                     jst_script.with_name('jst_scope_approval.py'), ids)
+                                diagnostic = {}
+                                if erp_result.exists():
+                                    diagnostic = json.loads(erp_result.read_text(encoding='utf-8'))
+                                if diagnostic.get('error_code') == 'scope_approval_required':
+                                    progress.handoff = record_handoff(journal, journal_path, 'erp', diagnostic)
                                 print(json.dumps({'company': args.company_name,
                                     'stage': 'erp_recovery_required', 'recovery': recovery},
                                     ensure_ascii=False), flush=True)
@@ -623,11 +741,13 @@ def _execute(args, folder, export_cmd, merge_cmd, run, gate, gate_cmd, resolve, 
             # Lean deliveries reuse the pre-enrichment inventory check: cache-only
             # transfer preserves its cells and publication verifies its exact hash.
             # Legacy/interrupted journals without that evidence still get one check.
-            if (journal.get('delivery', {}).get('validation_profile') != 'lean'
-                    or journal.get('validation', {}).get('ok') is not True):
+            if (journal['stage'] != 'complete' and
+                    (journal.get('delivery', {}).get('validation_profile') != 'lean'
+                     or journal.get('validation', {}).get('ok') is not True)):
                 journal['validation'] = progress.call('final_validation', validation.validate_inventory, output,args.company_name,folder,template)
             journal['main_sha256'] = digest(output)
-        journal['stage'] = 'complete'; save(journal_path,journal)
+        if journal['stage'] != 'complete':
+            journal['stage'] = 'complete'; save(journal_path,journal)
         summary = delivery_summary(journal, folder, output if merge_cmd else None)
         erp = journal.get('erp') or {}
         matching = erp.get('matching') or {}

@@ -120,13 +120,12 @@ class FinalizeTests(unittest.TestCase):
         argv = ["export", "--company-name", "公司", "--module", "罚款",
                 "--order-pay-start", "2026-01-01", "--order-pay-end", "2026-01-31",
                 "--batch-folder", str(self.root / "batch"), "--browser", "edge",
-                "--transport", "bridge", "--bridge-url", "http://127.0.0.1:8899", "--dry-run"]
+                "--transport", "playwright", "--dry-run"]
         with patch.object(export.sys, "argv", argv), patch.object(export.subprocess, "run") as run:
             run.return_value.returncode = 0
             self.assertEqual(export.main(), 0)
         cmd = run.call_args.args[0]
-        for option, value in [("--browser", "edge"), ("--transport", "bridge"),
-                              ("--bridge-url", "http://127.0.0.1:8899"), ("--module", "punishment-data")]:
+        for option, value in [("--browser", "edge"), ("--transport", "playwright"), ("--module", "punishment-data")]:
             self.assertEqual(cmd[cmd.index(option) + 1], value)
         self.assertIn("--dry-run", cmd)
         self.assertEqual(cmd[1], '-u')

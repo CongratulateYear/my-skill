@@ -6,8 +6,11 @@ import tempfile
 from openpyxl import load_workbook
 from openpyxl.styles import Font
 
-NODE = Path(r'D:\dsh\resources\runtime\primary-runtime\dependencies\node\bin\node.exe')
-CLI = Path(r'D:\dsh\resources\app.asar.unpacked\dsh\node_modules\@deepseek-ai\libreoffice-kit\lib\cli.js')
+from recalc_engine import resolve_recalc_engine
+
+# Optional legacy injection points; discovery is deferred until use, not import.
+NODE = None
+CLI = None
 
 
 def add_review(source, destination, erp, fine):
@@ -72,10 +75,9 @@ def _append_review(wb, erp, fine):
 
 
 def recalculate(source, destination, node=None, cli=None, progress=None):
-    node = Path(node or os.environ.get('TGC_RECALC_NODE') or NODE)
-    cli = Path(cli or os.environ.get('TGC_RECALC_CLI') or CLI)
-    if not node.is_file() or not cli.is_file():
-        raise ValueError('Formula recalculation engine unavailable; install configured Office sidecar, do not deliver stale caches')
+    node, cli = resolve_recalc_engine(
+        node=node if node is not None else (None if 'TGC_RECALC_NODE' in os.environ else NODE),
+        cli=cli if cli is not None else (None if 'TGC_RECALC_CLI' in os.environ else CLI))
     import importlib.util
     skill_root = Path(__file__).resolve().parents[2]
     helpers = [skill_root/name/'scripts'/'recalc_cache.py' for name in ('淘工厂合并','taogongchang-merge')]

@@ -25,14 +25,15 @@ class CompatibilityTests(unittest.TestCase):
   self.assertNotEqual(canonical_formula('IF(A1="\'商品货款\'!B1",1,0)'),canonical_formula('IF(A1="商品货款!B1",1,0)'))
  def test_business_amount_change_refused(self):
   from openpyxl import Workbook
-  with tempfile.TemporaryDirectory(dir=r'D:\deepseek') as d:
+  with tempfile.TemporaryDirectory() as d:
    d=Path(d); w=Workbook();w.active['A1']=100;w.active['B1']='=SUM(A1)';w.save(d/'source.xlsx')
    w.active['A1']=200;w.save(d/'lo.xlsx')
    with self.assertRaisesRegex(ValueError,'Calculation input changed'):
     transplant_caches(d/'source.xlsx',d/'lo.xlsx',d/'result.xlsx')
+ @unittest.skipUnless(Path(r'D:\deepseek\治发-兼容候选.xlsx').is_file() and Path(r'D:\deepseek\治发-兼容重算.xlsx').is_file(), 'Optional external Windows cache fixtures are not installed')
  def test_real_cache_transplant(self):
   source=Path(r'D:\deepseek\治发-兼容候选.xlsx');calc=Path(r'D:\deepseek\治发-兼容重算.xlsx')
-  with tempfile.TemporaryDirectory(dir=r'D:\deepseek') as d:
+  with tempfile.TemporaryDirectory() as d:
    result=transplant_caches(source,calc,Path(d)/'test.xlsx')
    self.assertEqual(result['formula_caches'],2417)
    self.assertEqual(result['empty_string_caches'],11)

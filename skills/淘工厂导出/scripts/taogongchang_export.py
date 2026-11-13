@@ -319,14 +319,16 @@ def main() -> int:
     p.add_argument("--batch-folder", type=Path, help="批次总目录；公司日期文件夹放在其内部，优先于 output-root")
     p.add_argument("--state-dir", type=Path, help="运行状态与临时工作目录（必须在公司导出目录之外）")
     p.add_argument("--browser", choices=["auto", "chrome", "chrome-beta", "chrome-canary", "edge", "brave", "chromium"])
-    p.add_argument("--transport", choices=["auto", "cookie", "bridge"])
-    p.add_argument("--bridge-url", help="原样透传给内置下载器")
+    p.add_argument("--transport", choices=["auto", "cookie", "playwright", "bridge"])
+    p.add_argument("--bridge-url", help="旧桥已停用；不再接受自定义桥地址")
     p.add_argument("--resume", action="store_true", help="跳过状态文件中已完成的流程")
     p.add_argument("--skip-module", action="append", default=[], help="跳过指定流程，可重复")
     p.add_argument("--dry-run", action="store_true", help="只显示请求计划，不实际导出")
     p.add_argument("--result-file", type=Path, help="本次发布凭证JSON（供总编排核实，不含凭据）")
     p.add_argument("--run-id", help="总编排本次运行标识")
     args = p.parse_args()
+    if args.bridge_url:
+        p.error("自建桥已停用；请使用 --transport playwright")
 
     module = MODULE_ALIASES.get(str(args.module).strip(), str(args.module).strip())
     if module not in {"all", *MODULE_DISPLAY_NAMES}:

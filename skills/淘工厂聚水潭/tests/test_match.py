@@ -338,7 +338,9 @@ class MatchingTests(unittest.TestCase):
         directory.symlink_to(self.root, target_is_directory=True)
         with self.assertRaises(m.MatchError):
             self.match(backup_dir=directory)
-        lock = self.fine.with_name(self.fine.name + '.lock')
+        from tgc_runtime import runtime_for
+        lock = runtime_for(self.fine) / 'match.lock'
+        lock.parent.mkdir(parents=True, exist_ok=True)
         lock.symlink_to(self.order)
         with self.assertRaises(m.MatchError):
             self.match()

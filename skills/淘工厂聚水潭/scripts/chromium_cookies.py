@@ -10,8 +10,8 @@ resulting cookie database):
 
 When the cookie store cannot be read (Windows v20 app-bound encryption, an
 Edge-exclusive Cookies file, or a sandbox that denies the temp area), the
-browser-bridge transport reuses the already-logged-in www.erp321.com tab
-instead: build_session(transport="auto") falls back to it automatically.
+use the official Playwright extension instead. build_session(transport="auto")
+uses official Playwright by default; native cookie reading is explicit legacy mode.
 
 Credentials never leave memory: nothing is written to the skill directory,
 state files, or logs. Only non-secret diagnostics are printed (stderr).
@@ -100,7 +100,7 @@ class SessionError(RuntimeError):
 
 
 class BridgeSessionError(SessionError):
-    """Cookie store unusable and the in-page fetch bridge is not available."""
+    """Legacy exception retained for callers; use official Playwright cookies."""
 
 
 # Windows-only: where a logged-in Edge/Chrome keeps its cookies. Edge keeps the
@@ -269,8 +269,8 @@ def _decrypt(encrypted: bytes, key: bytes, host: str) -> str:
     if prefix == b"v20":
         raise SessionError(
             "该浏览器的 cookie 使用 v20 应用绑定加密（App-Bound Encryption），本工具无法解密；"
-            "请改用浏览器桥传输（--transport bridge），或在浏览器设置里关闭应用绑定加密，"
-            "或换用未启用该加密的浏览器配置文件。" + (WINDOWS_COOKIE_LOCK_HINT if IS_WINDOWS else "")
+            "请使用官方Playwright扩展（--transport playwright），不要关闭应用绑定加密，"
+            "也不要新建浏览器配置文件。" + (WINDOWS_COOKIE_LOCK_HINT if IS_WINDOWS else "")
         )
     return encrypted.decode("utf-8", "replace")
 
@@ -285,7 +285,7 @@ def _read_rows(cookies_path: Path) -> list[tuple]:
     """Read the original encrypted DB read-only; never copy credential databases.
 
     Standard SQLite read-only mode honours WAL; locked stores fail over to the
-    browser bridge rather than using immutable stale snapshots or disk copies.
+    official Playwright extension rather than immutable stale snapshots or disk copies.
     """
     try:
         connection = sqlite3.connect(cookies_path.resolve().as_uri() + '?mode=ro', uri=True, timeout=2)

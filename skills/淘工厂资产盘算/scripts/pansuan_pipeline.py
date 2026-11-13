@@ -70,8 +70,16 @@ def startup_preflight(company_folder, output_dir, *, merge_required):
         required += [merge.PAN_SUAN_BUILDER, merge.PAN_SUAN_TEMPLATE,
                      merge.PAN_SUAN_BUILDER.with_name('template_compat.py')]
         import delivery_enrichment as delivery
-        required += [Path(os.environ.get('TGC_RECALC_NODE') or delivery.NODE),
-                     Path(os.environ.get('TGC_RECALC_CLI') or delivery.CLI)]
+        # Import in this interpreter: subprocesses use sys.executable, never an
+        # arbitrary python/py from PATH. The cache helper needs lxml as well.
+        from lxml import etree
+        try:
+            engine = delivery.resolve_recalc_engine(
+                node=None if 'TGC_RECALC_NODE' in os.environ else delivery.NODE,
+                cli=None if 'TGC_RECALC_CLI' in os.environ else delivery.CLI)
+        except ValueError as exc:
+            raise ValueError(f'启动预检：依赖或模板缺失；{exc}') from exc
+        required += list(engine)
         helpers = [SKILLS_ROOT / name / 'scripts' / 'recalc_cache.py'
                    for name in ('淘工厂合并', 'taogongchang-merge')]
         if not any(path.is_file() for path in helpers):
@@ -123,9 +131,9 @@ def safe_recovery(value):
         return None
     result = {}
     constants = {
-        'type': {'inspect-own-magpie-tab'}, 'executor': {'agent-with-magpie-browser'},
+        'type': {'inspect-own-magpie-tab'}, 'executor': {'agent-with-magpie-login-and-playwright-cookies'},
         'browser': {'current-existing-browser'}, 'tab': {'new-own-magpie-tab'},
-        'bridgeState': {'not_running','agent_missing','unverified'},
+        'accountSwitchPolicy': {'reuse-logged-in-erp-never-auto-switch'},
         'loginState': {'login-or-permission-required','unverified'},
         'prefilledCredentials': {'preserve-and-submit'},
         'credentialPrompt': {'only-after-form-inspection-if-missing'},
@@ -138,13 +146,8 @@ def safe_recovery(value):
         result['reason'] = value['reason']
     if value.get('expectCompany') is None or _safe_business_text(value.get('expectCompany')):
         result['expectCompany'] = value.get('expectCompany')
-    argv = value.get('bridgeStartArgv')
-    if (isinstance(argv, list) and len(argv) == 4 and argv[0] == 'python'
-            and _safe_path(argv[1], 'browser_bridge.py') and argv[2] == '--port'
-            and isinstance(argv[3], str) and argv[3].isdigit() and 1 <= int(argv[3]) <= 65535):
-        result['bridgeStartArgv'] = argv
-    if _safe_path(value.get('bridgeAgentSource'), 'bridge_agent.js'):
-        result['bridgeAgentSource'] = value['bridgeAgentSource']
+    if value.get('supportedBrowsers') == ['windows-edge','macos-chrome']:
+        result['supportedBrowsers'] = ['windows-edge','macos-chrome']
     policy = value.get('resumePolicy')
     if isinstance(policy, dict):
         result['resumePolicy'] = {key: True for key in ('sameInputs','sameOutputDirectory',
@@ -155,17 +158,7 @@ def safe_recovery(value):
             result[key] = expected
     if value.get('pythonControlsBrowser') is False:
         result['pythonControlsBrowser'] = False
-    known_steps = (
-        'Agent starts bridgeStartArgv as a tracked background job if bridge is not running; Python never injects Magpie.',
-        'Open workbench in a new own Magpie tab; do not touch user/other-agent tabs.',
-        'If already signed in, attach bridge and verify server session; do not log out.',
-        'If login is needed, inspect the real form refs and only credential presence, never password values.',
-        'Preserve prefilled credentials; if both fields are populated, click the real login submit without asking for credentials.',
-        'Only fill missing fields using ERP credentials explicitly supplied for this attempt; never use Taogongchang credentials.',
-        'Ask once for missing ERP credentials only after inspecting the form; do not extract or persist autofill/passwords.',
-        'Stop for human handling of SMS, captcha, slider or risk checks; do not bypass.',
-        'After submitting, attach bridge in the same own ERP tab and rerun server validation with original company constraint.',
-    )
+    known_steps = ('Use the current Windows Edge or macOS Chrome with the official Playwright extension; never start a browser or profile.', 'Open workbench in a new own Magpie tab; do not touch user/other-agent tabs.', 'If already signed in to ERP, reuse the session; do not compare accounts, log out or log in again.', 'If login is needed, inspect the real form refs and only credential presence, never password values.', 'Preserve prefilled credentials; if both fields are populated, click the real login submit without asking for credentials.', 'Only fill missing fields using ERP credentials explicitly supplied for this attempt; never use Taogongchang credentials.', 'Ask once for missing ERP credentials only after inspecting the form; do not extract or persist autofill/passwords.', 'Stop for human handling of SMS, captcha, slider or risk checks; do not bypass.', 'After Magpie login, start a fresh execution scope to acquire ERP cookies once with official Playwright, then rerun server validation with the original company constraint.', 'ERP checks login state only; never infer its account from Taogongchang or automatically switch accounts. An explicit company validation failure must stop without logging out.')
     if isinstance(value.get('steps'), list):
         result['steps'] = [step for step in value['steps'] if isinstance(step, str) and step in known_steps]
     human = value.get('humanRequired')
@@ -250,8 +243,10 @@ def run(command: list[str]) -> int:
     # Child diagnostics may contain credentials/HTTP bodies. Never relay raw streams.
     completed = subprocess.run(command, capture_output=True, text=True,
                                encoding="utf-8", errors="replace")
+    run.last_diagnostic = {}
     if completed.returncode:
         diagnostic = safe_diagnostic(parse_state(completed.stdout or ''))
+        run.last_diagnostic = diagnostic
         if diagnostic:
             print(json.dumps(diagnostic, ensure_ascii=False), flush=True)
     return completed.returncode
@@ -267,10 +262,23 @@ def run_gate(command: list[str]) -> tuple[int, dict]:
     return completed.returncode, state
 
 
-def main() -> int:
+def main(argv=None) -> int:
     import argparse
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if '--dry-run' in argv:
+        sys.dont_write_bytecode = True
+    if '--companies' in argv:
+        from serial_batch import execute as execute_batch
+        try:
+            return execute_batch(argv, main)
+        except (ValueError, OSError, KeyError):
+            print(json.dumps({'summary': {'execution_status': 'failed',
+                'conclusion': '流程未完成，需要处理后续跑',
+                'reason': 'serial_input_or_artifact_binding_failed'}}, ensure_ascii=False))
+            return 2
 
-    p = argparse.ArgumentParser(description="淘工厂资产盘算：登录闸门 → 导出 → 合并（单公司）")
+    p = argparse.ArgumentParser(description="淘工厂资产盘算：登录闸门 → 导出 → 合并（单公司）",
+        epilog="多公司统一入口：用 --companies 公司A 公司B 替代 --company-name，必须固定 --batch-folder；同输入 --resume 严格串行续跑。多公司不接收凭据、fetch或账号输入。")
     p.add_argument("--company-name", required=True, help="公司/店铺名称，取用户消息原文")
     p.add_argument("--mode", choices=["full", "export"], default="full",
                    help="full=导出+合并（淘工厂资产盘算）；export=仅导出（淘工厂资产盘算导出）")
@@ -292,29 +300,37 @@ def main() -> int:
     p.add_argument("--strict-account", action="store_true",
                    help="显式严格账号核对；公司匹配也阻断可比账号不符，须同时给 --expect-account")
     p.add_argument("--resume", action="store_true", help="从同一输出路径对应的内部运行状态续跑")
+    p.add_argument('--recover-hosting-task-id', help='仅经用户授权的原Hosting任务编号；只核验证据后关联，不创建任务')
+    p.add_argument('--recover-hosting-legacy-mtime', action='store_true', help='显式允许旧状态使用mtime时间证据；仅与编号及resume一起使用')
     p.add_argument("--browser", default="auto")
-    p.add_argument("--transport", choices=["auto", "cookie", "bridge"], default="auto")
+    p.add_argument("--transport", choices=["auto", "cookie", "playwright", "bridge"], default="auto")
     p.add_argument("--bridge-url")
     p.add_argument("--batch-folder", type=Path, help="多公司共用的批次总目录；各公司仍严格串行")
     p.add_argument("--output-dir", type=Path, help="显式覆盖合并输出目录；默认与公司导出文件夹并列（导出根或批次总目录）")
     p.add_argument("--dry-run", action="store_true", help="离线显示执行命令，不登录、不导出、不写文件")
-    p.add_argument("--erp-transport", choices=["auto", "cookie", "bridge"], default="auto")
+    p.add_argument("--erp-transport", choices=["auto", "cookie", "playwright", "bridge"], default="auto")
     p.add_argument("--erp-expect-company", help="用户明确指定的ERP公司，不从淘工厂简称推断")
     p.add_argument("--erp-browser", default="auto")
-    p.add_argument("--erp-bridge-url", help="独立ERP桥，默认8901；不复用淘工厂桥")
+    p.add_argument("--erp-bridge-url", help="旧桥已停用；不接受自定义桥地址")
     p.add_argument('--heartbeat-interval', type=float, default=60.0,
                    help='stderr安全进度心跳间隔秒数，须为有限正数（默认60；阶段切换立即报告）')
     p.add_argument('--erp-scope-approval-file', type=Path,
                    help='仅显式--resume：ERP下载范围授权证据文件')
     p.add_argument('--erp-proven-partner-consent', action='store_true',
                    help='仅已取得有证据合单伙伴仅ERP保留的固定授权时使用；离线六字段重验后最多续跑一次，不扩大处罚范围')
-    args = p.parse_args()
+    args = p.parse_args(argv)
+    if args.bridge_url or args.erp_bridge_url:
+        p.error("自建桥已停用；请使用 --transport playwright / --erp-transport playwright")
     if args.dry_run:
         # Dynamic layout imports must not create __pycache__ during dry-run.
         sys.dont_write_bytecode = True
     import math
     if not math.isfinite(args.heartbeat_interval) or args.heartbeat_interval <= 0:
         p.error('--heartbeat-interval 须为有限正数')
+    if args.recover_hosting_task_id and not args.resume:
+        p.error('--recover-hosting-task-id 只能与 --resume 一起使用')
+    if args.recover_hosting_legacy_mtime and not (args.resume and args.recover_hosting_task_id):
+        p.error('--recover-hosting-legacy-mtime 需要 --resume 和 --recover-hosting-task-id')
     if args.erp_scope_approval_file and not args.resume:
         p.error('--erp-scope-approval-file 只能与 --resume 一起使用')
     if args.strict_account and not (args.expect_account or "").strip():
@@ -436,11 +452,20 @@ def main() -> int:
         startup_preflight(company_folder,
                           args.output_dir or company_folder.parent,
                           merge_required=merge_cmd is not None)
-        return execute(args, company_folder, export_cmd, merge_cmd, run, run_gate,
-                       gate_cmd, resolve_skill_script)
+        # One company/run owns the memory-only cookie scope; all children inherit it.
+        login_scripts = str(Path(ensure_login).parent)
+        if login_scripts not in sys.path:
+            sys.path.insert(0, login_scripts)
+        from playwright_session import SessionScope
+        with SessionScope():
+            return execute(args, company_folder, export_cmd, merge_cmd, run, run_gate,
+                           gate_cmd, resolve_skill_script)
     except (ValueError, OSError, KeyError, ImportError):
         # Exceptions can contain child/network values or user-supplied paths.
         print('流水线未完成；保留成果，同批次 --resume；请核实阶段状态', file=sys.stderr, flush=True)
+        print(json.dumps({'summary': {'execution_status': 'failed', 'company': args.company_name,
+            'conclusion': '流程未完成，需要处理后续跑', 'resume_required': True,
+            'reason': 'input_artifact_or_dependency_validation_failed'}}, ensure_ascii=False), flush=True)
         return 2
 
 

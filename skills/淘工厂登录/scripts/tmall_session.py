@@ -456,95 +456,59 @@ def build_headers(browser: str = "auto", domain: str = DEFAULT_DOMAIN) -> dict[s
             return headers
     raise SessionError(
         "未能从本机 cookie 库取得可用会话，不代表浏览器未登录。"
-        "固定恢复路线：在当前已打开的浏览器中 tab_new 新建自己的 Magpie 标签页，"
-        "不复用用户或其他 agent 标签，不新开浏览器或 profile；"
-        "打开 https://tgc.tmall.com/ds/page/supplier/home，已登录直接桥接，确认未登录才填表。"
-        "后台起本 skill 的 scripts/browser_bridge.py --port 8899，read 本 skill 的 "
-        "scripts/bridge_agent.js 源码并在自己 tgc 页 evaluate 直接执行，不插入 script src。"
-        "凭据不落盘、不回显，验证码人工完成；重跑 ensure_login.py，保留 --expect-company，"
-        "以服务端公司验证通过且退出码 0 为成功标准。\n"
+        "请在当前已打开的浏览器中用 Magpie 自己的标签页检查登录，确认未登录才填表；"
+        "随后使用官方 Playwright Extension 读取 Cookie。凭据不得写入 shell、文件或日志。\n"
         + "\n".join(f"- {item}" for item in errors)
     )
 
 
-TRANSPORTS = ("auto", "cookie", "bridge")
+TRANSPORTS = ("auto", "cookie", "playwright", "bridge")
 
 
-def _bridge_module():
-    """延迟导入 browser_bridge；本 skill 未带时回退用 asset-inventory 的副本。
-
-    browser_bridge 是纯 stdlib（无 _bootstrap、无第三方依赖），跨 skill import
-    安全。返回模块对象。
-    """
+def build_playwright_session(browser="auto"):
+    from playwright_session import acquire_cookies, TMALL_URLS, scoped_opener, MCPError
     try:
-        import browser_bridge
-        return browser_bridge
-    except ImportError:
-        pass
-    # 同一 skills 根下已安装的 asset-inventory 提供 browser_bridge.py
-    candidates = [Path(__file__).resolve().parents[2] / "asset-inventory" / "scripts"]
-    for candidate in candidates:
-        if (candidate / "browser_bridge.py").is_file() and str(candidate) not in sys.path:
-            sys.path.append(str(candidate))
-    import browser_bridge
-    return browser_bridge
+        payload = acquire_cookies(TMALL_URLS, browser)
+        cookies = payload["cookies"]
+        # Compatibility header is only for identity hints and legacy diagnostics.
+        # scoped_opener strips it before HTTP and applies a faithful CookieJar.
+        headers = {
+            "cookie": "; ".join(c["name"] + "=" + c["value"] for c in cookies),
+            "user-agent": payload["userAgent"],
+            "accept": "application/json, text/plain, */*",
+            "content-type": "application/json",
+            "origin": "https://tgc.tmall.com",
+            "referer": TMALL_HOME_URL,
+            "x-requested-with": "XMLHttpRequest",
+        }
+        for cookie in cookies:
+            if cookie["name"] in XSRF_COOKIE_NAMES and cookie["value"]:
+                headers["x-xsrf-token"] = cookie["value"]
+                break
+        return headers, scoped_opener(cookies)
+    except MCPError as exc:
+        raise BridgeSessionError(str(exc)) from None
 
 
-def build_bridge_session(bridge_url: str | None = None) -> tuple[dict[str, str], Any]:
-    """借「已登录浏览器标签」拿会话：返回 (headers, session)。
-
-    页面里的 fetch 由浏览器自己附 HttpOnly cookie，因此在 cookie 库读不出来
-    （Windows v20 应用绑定加密 / Edge 独占 Cookies 文件 / 沙箱拦临时目录）的
-    机器上仍然可用。
-    """
-    bridge = _bridge_module()
-    try:
-        client = bridge.BridgeClient(bridge_url)
-        client.wait_ready(bridge.AGENT_READY_SECONDS)
-    except bridge.BridgeError as exc:
-        raise BridgeSessionError(str(exc)) from exc
-    headers: dict[str, str] = {}
-    cookie = str(client.session_info().get("cookie") or "")
-    if cookie:
-        # 只是给诊断/账号提示用；真实请求的 cookie 由浏览器自己加。
-        headers["cookie"] = cookie
-    headers.update(client.headers())
-    return headers, client
+def build_bridge_session(bridge_url=None):
+    """Legacy callable alias; never starts or contacts a custom page bridge."""
+    return build_playwright_session()
 
 
-def build_session(
-    transport: str = "auto",
-    browser: str | None = None,
-    domain: str = DEFAULT_DOMAIN,
-    bridge_url: str | None = None,
-) -> dict[str, Any]:
-    """统一构建 (headers, session)：cookie 库优先，失败自动回退浏览器桥。
+def build_session(transport="auto", browser=None, domain=DEFAULT_DOMAIN, bridge_url=None):
+    """Auto uses execution-scoped Extension cookies; explicit cookie is legacy native.
 
-    transport=native 的旧名字仍然接受，等同 cookie。返回
-    {"headers": ..., "session": build_opener() 或 BridgeClient, "transport": ...}。
+    A bridge argument is accepted as a compatibility alias, never page injection.
+    Identity validation remains with callers, unchanged from original.
     """
     mode = "cookie" if transport in ("native", "cookie") else transport
     if mode not in TRANSPORTS:
-        raise ValueError(f"未知 transport：{transport}（可选 auto / cookie / bridge）")
-    order = ("cookie", "bridge") if mode == "auto" else (mode,)
-    errors: list[str] = []
-    for item in order:
-        try:
-            if item == "cookie":
-                headers = build_headers(browser or "auto", domain)
-                return {"headers": headers, "session": build_opener(), "transport": "cookie"}
-            headers, client = build_bridge_session(bridge_url)
-            return {"headers": headers, "session": client, "transport": "bridge"}
-        except SessionError as exc:
-            errors.append(f"{item}：{str(exc).splitlines()[0] if str(exc) else '未知原因'}")
-        except Exception as exc:  # 桥端口被占、页面代理异常等
-            errors.append(f"{item}：{type(exc).__name__}: {exc}")
-    detail = "\n".join(f"- {line}" for line in errors)
-    if mode == "bridge" or (mode == "auto" and len(errors) > 1):
-        raise BridgeSessionError(
-            "拿不到天猫登录态：cookie 库与浏览器桥都不可用。\n" + detail
-        )
-    raise SessionError("拿不到天猫登录态。\n" + detail)
+        raise ValueError("Unknown session transport")
+    if mode == "cookie":
+        headers = build_headers(browser or "auto", domain)
+        return {"headers": headers, "session": build_opener(), "transport": "cookie"}
+    headers, opener = build_playwright_session(browser or "auto")
+    return {"headers": headers, "session": opener, "transport": "playwright"}
 
 
 def check_session(headers: dict[str, str], session: Any = None) -> bool:

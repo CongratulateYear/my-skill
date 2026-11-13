@@ -19,19 +19,20 @@ description: 聚水潭：跨Windows/macOS复用浏览器登录与Cookie，按主
 
 ## 条件预备与恢复协议（agent必须实际执行）
 
-罚款编排仅当**本次罚款导出成功且本次文件存在有效十进制主订单号**才预备ERP；不扫旧账单，不在无罚款/导出失败/空订单时提前启动8901。普通用户主动ERP导出不受罚款成功条件限制。
+罚款编排仅当**本次罚款导出成功且本次文件存在有效十进制主订单号**才预备ERP；不扫旧账单，不在无罚款/导出失败/空订单时提前获取ERP Cookie。普通用户主动ERP导出不受罚款成功条件限制。
 
 ```bash
 python scripts/jushuitan.py --shop-name "店铺" --fine-file "本次处罚数据.xlsx" --trigger fine-export --fine-export-succeeded --prepare-only
 ```
 
-`--fine-export-succeeded`是调用方对本次成功的显式声明，不是脚本从旧文件推断成功。`--prepare-only`仅离线验证输入，不读cookie、不联网、不建ERP任务、不回填；缺本次成功声明返回`preparation_status=skipped`，有效则`agent_required`及机器可读`recovery_action`，**不是已起桥或已登录**。空/无效订单失败且不返回浏览器预备动作。需要预备时，先运行`jst_session.py`尝试复用现有有效cookie，成功则无需浏览器；失败后执行计划：
+`--fine-export-succeeded`是调用方对本次成功的显式声明，不是脚本从旧文件推断成功。`--prepare-only`仅离线验证输入，不读Cookie、不联网、不建ERP任务、不回填；缺本次成功声明返回`preparation_status=skipped`，有效则`agent_required`及机器可读`recovery_action`，不代表已获取Cookie或已登录。空/无效订单失败且不返回浏览器预备动作。
 
-1. 实际agent按`bridgeStartArgv`后台起桥（记录job id），不是让Python假装控制Magpie；已有桥只复用，不随意重启其他任务。
-2. 实际agent用Magpie新建自己的ERP标签，read `bridgeAgentSource`完整源码并evaluate注入；检查真实表单的预填布尔值，已有预填保留并用真实按钮提交，只补缺失ERP凭据。短信/滑块/验证码/风险校验交人工。
-3. 原公司约束不变，运行`jst_session.py --transport bridge --expect-company ...`验证服务端查询；验证通过后才运行原ERP命令。不要把注入、URL变化或预填提交本身当成功。
-4. `session_status=bridge_not_running`表示桥未启动，`bridge_agent_missing`表示已起桥未注入；二者`loginState=unverified`，**不表示未登录**。`login_or_permission_required`是服务端登录/权限证据，仍需实际检查表单，不臆测密码缺失。兼容旧`reason=login-required`仅供旧方显示，以新分类为准。
-5. 失败结果含`stage/recovery_action.resumePolicy`；导出已尝试（含创建请求不确定）必须保留原输入、公司、输出目录、内部状态，用原命令加`--resume`，禁止删状态或换目录重新建单。会话阶段失败尚未创建任务，按`requiredResume`决定；若原命令已有`--resume`必须保留。交付已发布而匹配失败同样resume核验后再回填。不得自动重试未知下载域、公司不符或输入损坏；先解决相应错误，不能靠重新登录绕过。
+1. 默认`auto`使用同级淘工厂登录skill的官方Playwright扩展适配器；不启动旧桥、不注入页面代理。扩展为前置条件，仅支持当前已打开的Windows Edge/macOS Chrome，不开新浏览器或profile。
+2. 失败时实际agent用Magpie新建自己的ERP标签，先检查登录态。**已登录直接复用，不对比账号、不退出、不重复登录**。显式公司约束验证不通过只停止，不自动换号，也不从淘工厂账号推断ERP账号。
+3. 确认未登录才检查真实表单预填布尔值；已有预填保留并用真实按钮提交，只补缺失ERP凭据。短信/滑块/验证码/风险校验交人工。Magpie只做登录和页面动作，Playwright只获取Cookie，Python HTTP执行原订单接口。
+4. 登录成功后开启新的执行会话范围，运行`jst_session.py --transport playwright --expect-company ...`（仅在原命令已有公司约束时保留它），验证真实服务端订单查询；URL变化或预填提交本身不算成功。扩展未连接、浏览器未运行等失败是`unverified`，不是未登录证据。
+5. 同一执行范围的共享内存broker按ERP/Tmall分开缓存Cookie，只获取一次供子命令复用；范围过期或失效就停止，不偷偷重新连接或读取其他账号。登录/账号变化后须结束旧范围，由调用方明确开启新范围。Cookie、token不落盘。
+6. 失败结果含`stage/recovery_action.resumePolicy`；导出已尝试（含创建请求不确定）必须保留原输入、公司、输出目录、内部状态，用原命令加`--resume`，禁止删状态或换目录重新建单。会话阶段失败尚未创建任务，按`requiredResume`决定；若原命令已有`--resume`必须保留。交付已发布而匹配失败同样resume核验后再回填。不得自动重试未知下载域、公司不符或输入损坏；不能靠重新登录绕过。
 
 ## 一、登录获取 Cookie
 
@@ -45,32 +46,23 @@ python scripts/jst_session.py
 python scripts/jst_session.py --expect-company 公司名称
 ```
 
-退出码0表示服务端订单页校验有效，立即复用，不打开登录页。退出码3只表示会话未验证（兼容字段 `loggedIn=false/reason=login-required` 不是已确认退出），先执行结构化 `nextAction`；`action` 保持字符串便于旧调用方展示，`diagnostic` 为安全诊断。**不得看到失败就立即要求用户登录/提供密码**：先在当前浏览器自己的新Magpie标签检查会话与真实登录表单。Cookie读取被锁或v20不代表未登录，先尝试浏览器桥。公司校验目前从订单页显式公司字段提取：查不到就阻断，不以Cookie自报公司作身份凭证；真实页面若字段结构不同，必须补采样适配，不能放宽为无校验。
+退出码0表示服务端订单页校验有效，立即复用，不打开登录页。退出码3只表示会话未验证（兼容字段 `loggedIn=false/reason=login-required` 不是已确认退出），先执行结构化 `nextAction`；`action` 保持字符串便于旧调用方展示，`diagnostic` 为安全诊断。**不得看到失败就立即要求用户登录/提供密码**：先在当前浏览器自己的新Magpie标签检查会话与真实登录表单。Cookie读取被锁或v20不代表未登录；默认用官方Playwright扩展，不要求关闭浏览器或降低加密。公司校验目前从订单页显式公司字段提取：查不到就阻断，不以Cookie自报公司作身份凭证；真实页面若字段结构不同，必须补采样适配，不能放宽为无校验。
 
 Python 不能直接控制 Magpie；`nextAction` 是给 agent 的操作计划，不是脚本已经执行的浏览器动作。不得伪造“已自动登录/点击/检查预填”；必须实际调用 magpie-browser，只有服务端订单查询和本次公司约束均通过才算成功。
 
-### 跨平台读取
+### 官方Playwright Cookie与HTTP会话
 
-本地Chromium数据库只解密适用 `www.erp321.com` 的Cookie；macOS钥匙串Safe Storage + AES-CBC，Windows Local State + DPAPI/AES-GCM；兼容Chrome/Edge/Brave/Chromium及Cookies、Network/Cookies两种布局。只读到内存CookieJar，保留域/path/secure，不输出Cookie。新版v20/库锁则auto回退浏览器桥，不要求关闭浏览器。
+默认`auto`和`playwright`从同级登录skill调用`acquire_cookies(["https://www.erp321.com/"], browser=...)`，官方扩展可取得HttpOnly Cookie，仅在内存传给受限CookieJar。HTTP仅允许`https://www.erp321.com`的443端口，禁止认证会话跨域重定向；外域下载继续使用独立无凭据连接。服务端订单页与只读查询仍是成功依据，不以Cookie名或页面URL认定已登录。
 
-### 浏览器桥
+`--transport cookie`仅作为显式兼容选项读取本地Chromium数据库，不属于默认共享缓存路径。旧`--transport bridge`只是`playwright`别名，绝不会启动旧桥；`--bridge-url`非空明确报停。旧桥源码只留作历史测试，禁止调用、启动或注入。无需8899/8901页面桥端口。
 
-专用端口 **8901**，与淘工厂8899互不影响；不要复用淘工厂桥。
+需要恢复时：
+1. 用Magpie检查当前浏览器自己开的ERP标签，已登录直接复用，不比较账号。确认未登录才进入`/login.aspx`。
+2. snapshot真实表单，只检查账号/密码是否有值的布尔状态，绝不读出/返回/打印密码，不用返回密码的evaluate或表单序列化，不截图可见密码，不写凭据到脚本/文件/日志/回复。
+3. 已预填账号和密码时保留原值，直接真实按钮提交。仅补用户本次明确给出的缺失**聚水潭**凭据，不使用淘工厂密码、不提取密码库、不清空预填。缺凭据在检查后只询问一次并等待；错误密码不得循环重试。验证码/滑块/短信/风险校验停给人工。
+4. Magpie登录后用新的执行范围获取ERP Cookie一次并验证服务端；原公司约束保留，验证失败停止，不退出/换号。用户明确要求换ERP账号属于新的单独操作，不能从公司不符推导授权。
 
-1. 后台运行 `python scripts/browser_bridge.py --port 8901`，记住后台job id。
-2. 用magpie检查当前浏览器。在自己的新Magpie标签打开 `/epaas`。已登录则不去登录页；需要登录才进入 `/login.aspx`。
-3. 登录后在同一个自己开的ERP标签注入技能自带 `scripts/bridge_agent.js` 文件完整内容（read后evaluate），不要打印document.cookie。也可加载桥的agent.js；站点CSP/Private Network阻止加载时直接evaluate源码；浏览器拒绝本地连接需用户批准，不能绕过。
-4. 重跑 `python scripts/jst_session.py --transport bridge --wait 30`。服务端有效才算成功；URL或isLogin=true本身不是成功依据。注入桥不会读取HttpOnly Cookie，实际请求由浏览器自动附带。
-5. 若仍需登录，先snapshot真实表单，取得账号框、密码框、提交按钮ref。只检查“是否有值”的布尔状态，**不读出/返回/打印密码值**；不要调用返回密码的evaluate、text或表单序列化，不截图含可见密码的表单，不将凭据写入脚本/文件/日志/回复。
-   - 账号和密码已有预填（包括浏览器自动填充）时，**保留原值，不覆盖、不索取凭据，直接用真实按钮ref click提交**。预填可自动提交，不因用户当轮未再次给密码而拒绝。
-   - 缺账号时只补用户当轮给定的**聚水潭**账号，再次仅检查密码是否有值；账号输入可能触发浏览器自动填充，保留新出现的预填密码，仅补仍缺失字段。绝不使用淘工厂密码，不从浏览器密码库提取凭据，已有预填字段不得用空串覆盖。
-   - 无可用凭据只询问一次，在当前会话任务记录中标明等待项与原任务（不记录秘密），结束回复等待用户。无新输入或新会话证据不重复催问、重新提交或重启；自动续轮不算用户授权。密码过期提醒仅在页面明确允许继续且无强制修改/风险校验时确认继续，不擅自更改密码。
-   - 短信、滑块、验证码/风险校验必须让用户在该标签人工完成，不能自动获取短信或绕过。错误密码不得循环提交同一预填；仅有用户更正后再试，总计最多重试2次。无Magpie连接/站点拒绝等工具限制才报告具体阻塞，不冒充已检查表单。
-   - 提交后在同一个自己的ERP标签注入桥并重跑第4步（保留原 `--expect-company`）；URL变化、cookie标志或表单消失均不替代服务端验证。桥标签在任务完成前不要关闭。
-
-桥绑定一个明确的ERP标签代理；第二个标签不会随机抢走任务，而会被拒绝。切换账号必须先结束前一任务，再停止/重启本次后台桥，向新的自己开的ERP标签重新注入。桥仅限可信本机同用户环境，Origin检查与agent绑定不构成本地恶意进程隔离。不要把8901暴露到网络。
-
-纯程序调用：`jst_session.build_session(transport='auto', browser='auto', bridge_url=None, expect_company=None)` 返回内存 `session/headers/transport/identity`；不把返回对象落盘。session提供get/post；Cookie模式拒绝HTTP及跨域跳转。账号切换必须在前一家公司全部完成后，并让用户确认退出。
+纯程序调用：`jst_session.build_session(transport='auto', browser='auto', bridge_url=None, expect_company=None)` 返回内存`session/headers/transport/identity`，session提供get/post。总编排应在共享`SessionScope()`中运行子命令，复用ERP独立缓存；独立脚本没有范围时只能本进程复用，不能声称跨命令已复用。不得把返回对象落盘。
 
 ## 二、数据导出
 
@@ -106,17 +98,17 @@ python scripts/jushuitan.py --shop-name "店铺名称" --fine-file "罚款文件
 python scripts/jushuitan.py --shop-name "店铺名称" --order-ids "123456789" --dry-run
 ```
 
-示例订单号应替换为真实十进制主订单号，不接受占位词。可加 `--expect-company`、`--transport bridge`、`--browser edge`；默认优先已登录会话。罚款存在多候选Sheet时用 `--sheet` 明确。订单下载名为 `店铺名称_聚水潭订单.xlsx` 或 `.zip`；已有文件需--resume核验同一任务后复用，否则停止；不覆盖ERP原始导出。罚款默认ERP目录为原表目录下“聚水潭订单”，禁止与处罚数据放同一层。
+示例订单号应替换为真实十进制主订单号，不接受占位词。可加 `--expect-company`、`--transport playwright`、`--browser edge`；默认优先已登录会话。罚款存在多候选Sheet时用 `--sheet` 明确。订单下载名为 `店铺名称_聚水潭订单.xlsx` 或 `.zip`；已有文件需--resume核验同一任务后复用，否则停止；不覆盖ERP原始导出。罚款默认ERP目录为原表目录下“聚水潭订单”，禁止与处罚数据放同一层。
 
 ## 待验收下载与显式合单授权
 
-### 用户已记录的合单处理偏好（2026-11-07）
+### 授权来源与适用范围
 
-用户已明确同意：有本任务真实查询合单证据的额外伙伴，仅保留于ERP原始导出，不新增处罚行或金额；此类问题记录后不再重复询问。永夜任务207249359、原订单5127747193392051313、伙伴5127761341001006121已获本任务明确批准。后续同类情形可依据此固定授权处理，但必须逐任务核验完整合单证据并重新生成绑定本任务六字段的授权文件，不能复用旧JSON。此偏好不是无证据额外订单、未知格式、扩大处罚范围、重新建单/下载或ERP换号的授权；这些异常仍应停止。以下“本任务同意”对该严格边界内情形由本固定授权满足，不再逐次向用户提问，其余验证规则不变。
+本skill不内置任何个人或历史任务的持续授权。历史示例、旧错误和本文件本身都不是当前用户同意。只有当前用户对本任务的明确批准，或当前用户另行明确授予、可在会话中核对范围的持续授权，才允许生成合单授权文件。每次仍须完整核验本任务合单证据及六字段，不能复用旧JSON。该授权不涵盖无证据额外订单、未知格式、扩大处罚范围、重新建单/下载或ERP换号。没有可核实授权就停止询问，不从错误结果推导同意。
 
 - 下载取得的合法Excel/ZIP先原子保存于内部运行目录，绑定任务ID、原始输出参数、请求有序订单集合及SHA-256；范围不符仍保留，不作为交付。相同输入`--resume`优先离线核验，不再次取下载地址或下载。待验收文件缺失、损坏或绑定不一致必须停止，不能自动重下掩盖状态。
 - 普通订单必须精确命中请求；逗号/冒号复合字段只接受明确合单标志和合法十进制结构，记录内部订单关联证据。未知格式或无证据额外订单阻断。公共`validate_order_coverage`始终精确集合核验。
-- 错误中的`error_details.approval_required`只是**待人工批准的业务证据**，`approved=false`不能执行。先告知用户额外订单、合单证据及仅ERP保留、处罚不新增行/金额的边界；明确获得本任务同意后，才用下述离线工具生成授权。除上述用户已记录固定授权严格覆盖的有证据合单情形外，不得自动批准；任何情形均不得扩大已证实集合或复用其他公司/批次的授权JSON；计划内账号切换本身不涵盖额外订单。不要手工用PowerShell拼接授权JSON。
+- 错误中的`error_details.approval_required`只是**待人工批准的业务证据**，`approved=false`不能执行。先告知用户额外订单、合单证据及仅ERP保留、处罚不新增行/金额的边界；明确获得本任务同意后，才用下述离线工具生成授权。除当前用户明确授予且本次可核实的持续授权严格覆盖的有证据合单情形外，不得自动批准；任何情形均不得扩大已证实集合或复用其他公司/批次的授权JSON；计划内账号切换本身不涵盖额外订单。不要手工用PowerShell拼接授权JSON。
 - 授权JSON恰好六字段：`approved`、`task_id`、`sha256`、`output`、`requested_ids`、`extra_ids`。任务/哈希/原始输出/原请求顺序/额外集合均严格一致；额外订单必须有本任务查询合单证据。旧状态缺证据不能凭空批准。
 - 原命令保持所有身份与输入不变，增加`--resume --scope-approval-file "内部授权JSON路径"`。总编排对应`--erp-scope-approval-file`，只在同任务续跑使用。不得编辑状态、替换验证函数、monkeypatch下载或删除任务记录以恢复。
 - 授权仅允许保留已证明的合单伙伴，处罚回填仍只遍历原处罚行；关联伙伴不得增加处罚行或金额。批准范围单独保存在状态/安全结果，普通验收规则不变。

@@ -34,7 +34,7 @@ class PreparationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             result = Path(root)/'result.json'
             output = io.StringIO()
-            with patch.object(cli,'build_session',side_effect=session.SessionError('secret signed URL','bridge_not_running')), redirect_stdout(output):
+            with patch.object(cli,'build_session',side_effect=session.SessionError('secret signed URL','extension_not_connected')), redirect_stdout(output):
                 code = cli.main(['--shop-name','测试','--order-ids','123','--output-dir',str(Path(root)/'business'),
                                  '--result-file',str(result),'--expect-company','公司','--resume'])
             self.assertEqual(code,3)
@@ -44,11 +44,11 @@ class PreparationTests(unittest.TestCase):
             self.assertTrue(data['recovery_action']['resumePolicy']['requiredResume'])
             self.assertNotIn('secret',result.read_text(encoding='utf-8'))
 
-    def test_bridge_absent_and_agent_absent_are_not_login_failure(self):
-        for state, code in [({},'bridge_not_running'),({'ok':True},'bridge_agent_missing')]:
-            with patch.object(browser_bridge,'ping',return_value=state):
+    def test_playwright_failures_are_not_login_failure(self):
+        for code in ('extension_not_connected','playwright_unavailable','session_scope_expired'):
+            with patch.object(session,'_playwright_session',side_effect=session.SessionError('safe',code)):
                 with self.assertRaises(session.SessionError) as cm:
-                    session.build_session('bridge')
+                    session.build_session('playwright')
             self.assertEqual(cm.exception.code,code)
             self.assertEqual(session.recovery_action(code)['loginState'],'unverified')
 

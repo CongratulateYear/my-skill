@@ -78,3 +78,7 @@ python3 "$SKILL_DIR/scripts/merge_excel.py" \
 - `pan_suan_builder.py` 与 `assets/盘算模板.xlsx` 优先从本 skill 的 `scripts/`、`assets/` 成对读取，与技能中文/英文目录名无关；仅内置资源不完整时，按当前技能的父目录动态查找同级 `asset-inventory` 或 `资产盘算` 的完整资源对。不固定 Windows 用户/盘符，不安装其他技能。子进程统一以 UTF-8 编码通信（Windows GBK 控制台下也不会崩）。
 
 身份字段说明：`erpMobile` 仅为 ERP 绑定信息，不代表当前实际登录手机号；公司名称才是默认身份判据。
+
+## 会话说明
+
+本技能仍纯本地，不连接Playwright、不获取Cookie。上游导出改为官方扩展和执行期内存复用，不改变本技能公式、模板或文件识别。
